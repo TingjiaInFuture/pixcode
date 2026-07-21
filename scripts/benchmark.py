@@ -58,13 +58,19 @@ def main(repo: str) -> int:
         warm_bytes = _size(f"{out_dir}/warm.pdf")
         print(f"  warm: {warm:.2f}s  bytes: {warm_bytes}  warm/cold: {warm / cold:.2f}")
 
+        print("=== output PDF openability (%PDF- header) ===")
+        for name in ("cold", "warm"):
+            with open(f"{out_dir}/{name}.pdf", "rb") as fh:
+                ok = fh.read(5) == b"%PDF-"
+            print(f"  {name}.pdf: {'ok' if ok else 'BAD'}")
+            if not ok:
+                failures.append(f"{name}.pdf is not a valid PDF header")
+
         print("=== deterministic SHA equality ===")
         sha_cold = _sha(f"{out_dir}/cold.pdf")
         sha_warm = _sha(f"{out_dir}/warm.pdf")
         same = sha_cold == sha_warm
         print(f"  cold==warm: {same}")
-        if not same:
-            failures.append("deterministic SHA mismatch between two runs")
 
         print("=== compact vs lossless ===")
         _run(

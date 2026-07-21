@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from pixrep.file_utils import char_display_width, display_width
-from pixrep.onepdf_pack import _ascii_safe, _wrap_line
+from pixrep.onepdf_pack import _ascii_safe, _strip_python_docstrings, _wrap_line
 from pixrep.onepdf_writer import StreamingPDFWriter
 
 
@@ -28,6 +28,21 @@ class TestOnepdfBasic(unittest.TestCase):
         self.assertGreater(len(wrapped), 1)
         for line in wrapped:
             self.assertLessEqual(display_width(line), 6)
+
+    def test_strip_docstring_preserves_inline_code(self):
+        # A docstring that shares its line with real code (e.g. a ternary) must
+        # not be dropped, and the docstring itself must not take code with it.
+        src = 'def f():\n    "doc"; return 1\n'
+        out = _strip_python_docstrings(src)
+        self.assertIn("return 1", out)
+
+    def test_strip_docstring_cjk_byte_col_offset(self):
+        # Regression: AST col_offset is a UTF-8 byte offset; a CJK char before
+        # the docstring must not corrupt the "alone on its line" check.
+        src = 'x = 1\n\n\ndef f():\n    "中文说明"\n    return 2\n'
+        out = _strip_python_docstrings(src)
+        self.assertIn("return 2", out)
+        self.assertNotIn("中文说明", out)
 
     def test_streaming_writer_atomic_no_tmp_leftover(self):
         with tempfile.TemporaryDirectory() as d:
