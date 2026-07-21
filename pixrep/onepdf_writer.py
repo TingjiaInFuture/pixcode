@@ -75,8 +75,12 @@ class StreamingPDFWriter:
         text = self._canvas.beginText()
         text.setTextOrigin(start_x, self._page_height - top_margin - font_size)
         text.setLeading(leading)
+        last_font = None
         for line in lines:
-            text.setFont(self._font_for_line(line), font_size)
+            font = self._font_for_line(line)
+            if font != last_font:
+                text.setFont(font, font_size)
+                last_font = font
             text.textLine(line)
         self._canvas.drawText(text)
         self._canvas.showPage()

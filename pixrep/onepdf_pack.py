@@ -4,6 +4,7 @@ import ast
 import contextlib
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -76,7 +77,13 @@ def collect_core_files(
     # Build the combined ignore set including optional core-only extras.
     combined_ignore = [*extra_ignore]
     if core_only:
-        combined_ignore = [*combined_ignore, *DEFAULT_CORE_IGNORE_PATTERNS]
+        # Keep README.md reachable (don't blanket-ignore *.md at the scanner);
+        # non-README markdown is filtered out in the loop below so importance
+        # can still rank README first.
+        combined_ignore = [
+            *combined_ignore,
+            *(p for p in DEFAULT_CORE_IGNORE_PATTERNS if p != "*.md"),
+        ]
 
     scanner = RepoScanner(
         str(repo_root),
@@ -110,6 +117,15 @@ def collect_core_files(
 
     for info in repo.files:
         rel_posix = normalize_posix_path(info.path)
+
+        # core-only: exclude markdown except README.md (kept for LLM context).
+        if (
+            core_only
+            and rel_posix.lower().endswith(".md")
+            and rel_posix.rsplit("/", 1)[-1].lower() != "readme.md"
+        ):
+            stats["ignored_by_pattern"] = stats.get("ignored_by_pattern", 0) + 1
+            continue
 
         # git allow-list filter.
         if git_set is not None and rel_posix not in git_set:
@@ -168,32 +184,57 @@ def _wrap_line(line: str, max_cols: int) -> list[str]:
 def _strip_python_docstrings(content: str) -> str:
     """AST-safe removal of Python docstrings (module/class/function).
 
-    Drops only the docstring line ranges; all other code and formatting is
-    preserved verbatim. Falls back to the original text on a syntax error.
+    Only drops a docstring when it is the sole content on its line(s), so a
+    construct like ``"doc"; return 1`` is left intact. Functions/classes whose
+    body would become empty get a ``pass`` inserted to stay syntactically valid.
+    Falls back to the original text on a syntax error.
     """
     try:
         tree = ast.parse(content)
     except SyntaxError:
         return content
+    lines = content.splitlines(keepends=True)
     drop: set[int] = set()
+    pass_at: dict[int, str] = {}
     for node in ast.walk(tree):
         if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             continue
         body = node.body
-        if (
+        if not (
             body
             and isinstance(body[0], ast.Expr)
             and isinstance(body[0].value, ast.Constant)
             and isinstance(body[0].value.value, str)
         ):
-            doc = body[0]
-            for ln in range(doc.lineno, (doc.end_lineno or doc.lineno) + 1):
-                drop.add(ln)
+            continue
+        doc = body[0]
+        first_idx = doc.lineno - 1
+        last_idx = (doc.end_lineno or doc.lineno) - 1
+        if first_idx >= len(lines) or last_idx >= len(lines):
+            continue
+        # Require the docstring to be alone on its line(s): nothing but
+        # whitespace before it on the first line or after it on the last.
+        if lines[first_idx][: doc.col_offset].strip():
+            continue
+        if lines[last_idx][doc.end_col_offset :].strip():
+            continue
+        for ln in range(doc.lineno, (doc.end_lineno or doc.lineno) + 1):
+            drop.add(ln)
+        if len(body) == 1 and isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            indent = lines[first_idx][: doc.col_offset]
+            pass_at[doc.lineno] = f"{indent}pass"
     if not drop:
         return content
-    return "".join(
-        line for i, line in enumerate(content.splitlines(keepends=True), 1) if i not in drop
-    )
+    out = []
+    for i, line in enumerate(lines, 1):
+        if i in drop:
+            if i in pass_at:
+                out.append(pass_at[i] + "\n")
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 class _BlockCache:
@@ -225,8 +266,13 @@ class _BlockCache:
 
     def save(self, git_blob: str, opts_sig: str, lines: list[str]) -> None:
         path = self._path(git_blob, opts_sig)
-        with contextlib.suppress(OSError):
-            path.write_text(json.dumps(lines, ensure_ascii=False), encoding="utf-8")
+        tmp = path.with_name("." + path.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(lines, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink(missing_ok=True)
 
 
 def _normalize_block(
@@ -321,25 +367,38 @@ def _module_name(rel_posix: str) -> str:
     return ".".join(parts)
 
 
-def _python_imports(content: str) -> set[str]:
+def _python_imports(content: str, current_pkg: str = "") -> set[str]:
+    """Resolve imported module names, including relative imports (PEP 328)
+    resolved against ``current_pkg``. Returns fully-qualified names so they can
+    match the full module names produced by ``_module_name``."""
     try:
         tree = ast.parse(content)
     except SyntaxError:
         return set()
     mods: set[str] = set()
+    pkg_parts = current_pkg.split(".") if current_pkg else []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                mods.add(alias.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            mods.add(node.module.split(".")[0])
+                mods.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level > 0:
+                # Relative import: resolve against the current package.
+                drop = node.level - 1
+                base = pkg_parts[: len(pkg_parts) - drop] if drop <= len(pkg_parts) else []
+                target = [*base, node.module] if node.module else base
+                if target:
+                    mods.add(".".join(target))
+            elif node.module:
+                mods.add(node.module)
     return mods
 
 
 def _dependency_order(files: list[PackedFile]) -> None:
     """Order files so widely-depended-on Python modules come first (an
     approximation of import-topological order; non-Python falls back to
-    importance). Reads Python sources to resolve imports."""
+    importance). Imports are resolved as full module names with relative imports
+    resolved against each file's package."""
     mod_to_rel = {_module_name(f.rel_posix): f.rel_posix for f in files if f.language == "python"}
     popularity = {f.rel_posix: 0 for f in files}
     for f in files:
@@ -349,10 +408,15 @@ def _dependency_order(files: list[PackedFile]) -> None:
             content = f.abs_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for imp in _python_imports(content):
-            rel = mod_to_rel.get(imp)
-            if rel and rel != f.rel_posix:
-                popularity[rel] += 1
+        pkg = _module_name(str(f.rel_posix).rsplit("/", 1)[0]) if "/" in f.rel_posix else ""
+        imps = _python_imports(content, pkg)
+        for mod, target_rel in mod_to_rel.items():
+            if target_rel == f.rel_posix:
+                continue
+            # f depends on target if it imports target's module exactly or as a
+            # prefix (e.g. `import pixrep.scanner` depends on pixrep.scanner).
+            if mod in imps or any(i.startswith(mod + ".") for i in imps):
+                popularity[target_rel] += 1
     files.sort(key=lambda f: (-popularity[f.rel_posix], _importance_key(f)))
 
 
