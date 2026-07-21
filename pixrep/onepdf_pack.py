@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +49,7 @@ class PackedFile:
     language: str
     size: int
     line_count: int
+    git_blob: str = ""
 
 
 def collect_core_files(
@@ -122,6 +126,7 @@ def collect_core_files(
                 language=info.language,
                 size=info.size,
                 line_count=info.line_count,
+                git_blob=info.git_blob or "",
             )
         )
         stats["included"] += 1
@@ -156,6 +161,76 @@ def _wrap_line(line: str, max_cols: int) -> list[str]:
     if cur:
         result.append("".join(cur))
     return result
+
+
+class _BlockCache:
+    """Per-file cache of normalised ONEPDF blocks (ONEPDF v2).
+
+    A block key combines the working-tree content hash with the normalisation
+    options, so a warm cache reuses the cleaned/wrapped lines without re-reading
+    the source file."""
+
+    def __init__(self, cache_dir: Path):
+        self.cache_dir = cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, git_blob: str, opts_sig: str) -> Path:
+        key = hashlib.sha256(f"{git_blob}|{opts_sig}".encode()).hexdigest()
+        return self.cache_dir / f"{key}.json"
+
+    def load(self, git_blob: str, opts_sig: str) -> list[str] | None:
+        path = self._path(git_blob, opts_sig)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if isinstance(data, list):
+            return [str(x) for x in data]
+        return None
+
+    def save(self, git_blob: str, opts_sig: str, lines: list[str]) -> None:
+        path = self._path(git_blob, opts_sig)
+        with contextlib.suppress(OSError):
+            path.write_text(json.dumps(lines, ensure_ascii=False), encoding="utf-8")
+
+
+def _normalize_block(
+    f: PackedFile,
+    tab_size: int,
+    max_cols: int,
+    compact: bool,
+    wrap: bool,
+    block_cache: _BlockCache | None = None,
+) -> list[str]:
+    opts_sig = f"{tab_size}|{max_cols}|{int(compact)}|{int(wrap)}"
+    if block_cache is not None:
+        cached = block_cache.load(f.git_blob, opts_sig)
+        if cached is not None:
+            return cached
+    lines: list[str] = []
+    try:
+        with f.abs_path.open("r", encoding="utf-8", errors="replace") as src:
+            prev_blank = False
+            for raw_line in src:
+                line = raw_line.rstrip("\n")
+                if compact:
+                    line = line.rstrip()
+                    is_blank = not line
+                    if is_blank and prev_blank:
+                        continue
+                    prev_blank = is_blank
+                safe_line = _ascii_safe(line, tab_size)
+                if wrap:
+                    lines.extend(_wrap_line(safe_line, max_cols))
+                else:
+                    lines.append(safe_line)
+    except OSError:
+        lines = ["(read failed)"]
+    if block_cache is not None:
+        block_cache.save(f.git_blob, opts_sig, lines)
+    return lines
 
 
 def _importance_key(f: PackedFile) -> tuple[int, str]:
@@ -201,6 +276,7 @@ def pack_repo_to_one_pdf(
     profile: str = "compact",
     deterministic: bool = False,
     order: str = "importance",
+    cache_dir: Path | None = None,
 ) -> dict[str, int]:
     """Pack repository files into a single minimized PDF (ONEPDF_CORE).
 
@@ -277,6 +353,7 @@ def pack_repo_to_one_pdf(
     emit("")
 
     # ── File content ──────────────────────────────────────────────────
+    block_cache = _BlockCache(cache_dir) if cache_dir else None
     for idx, f in enumerate(files, start=1):
         if compact:
             emit(f"@@ {f.rel_posix} {f.language}")
@@ -286,28 +363,8 @@ def pack_repo_to_one_pdf(
             )
             emit(header)
             emit("-" * min(max_cols, max(10, len(header))))
-        try:
-            src = f.abs_path.open("r", encoding="utf-8", errors="replace")
-        except OSError:
-            emit("(read failed)")
-            emit("")
-            continue
-        prev_blank = False
-        with src:
-            for raw_line in src:
-                line = raw_line.rstrip("\n")
-                if compact:
-                    line = line.rstrip()
-                    is_blank = not line
-                    if is_blank and prev_blank:
-                        continue
-                    prev_blank = is_blank
-                safe_line = _ascii_safe(line, tab_size)
-                if wrap:
-                    for chunk in _wrap_line(safe_line, max_cols):
-                        emit(chunk)
-                else:
-                    emit(safe_line)
+        for line in _normalize_block(f, tab_size, max_cols, compact, wrap, block_cache):
+            emit(line)
         emit("")
 
     flush_page()

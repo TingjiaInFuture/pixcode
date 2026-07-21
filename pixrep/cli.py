@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -504,6 +505,28 @@ def _run_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _onepdf_cache_dir(repo_root: Path) -> Path:
+    """Resolve the ONEPDF block-cache directory (mirrors the cache root used by
+    the semantic/lint caches)."""
+    env = os.environ.get("PIXREP_CACHE_DIR", "").strip()
+    if env:
+        base = Path(env).expanduser().resolve() / repo_root.name
+    elif os.name == "nt":
+        base = (
+            Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+            / "pixrep"
+            / "cache"
+            / repo_root.name
+        )
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+        if xdg:
+            base = Path(xdg).expanduser().resolve() / "pixrep" / repo_root.name
+        else:
+            base = Path.home() / ".cache" / "pixrep" / repo_root.name
+    return base / "onepdf" / "blocks"
+
+
 def _run_onepdf(args: argparse.Namespace) -> int:
     repo_path = Path(args.repo).resolve()
     if not repo_path.is_dir():
@@ -530,6 +553,7 @@ def _run_onepdf(args: argparse.Namespace) -> int:
         profile=args.profile,
         deterministic=args.deterministic,
         order=args.order,
+        cache_dir=_onepdf_cache_dir(repo_path),
     )
     log.info(
         "onepdf summary: seen=%d, included=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d, pages=%d, output=%d bytes",
