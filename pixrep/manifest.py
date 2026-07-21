@@ -23,6 +23,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .constants import RENDER_SCHEMA_VERSION
 from .version import __version__
 
 
@@ -118,6 +119,7 @@ def compute_options_hash(
             f"eslint={eslint_version}",
             f"ruffcfg={ruff_config_sig}",
             f"eslintcfg={eslint_config_sig}",
+            f"rschema={RENDER_SCHEMA_VERSION}",
         ]
     )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()

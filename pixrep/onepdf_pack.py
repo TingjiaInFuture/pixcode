@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .constants import ONEPDF_BLOCK_SCHEMA_VERSION
 from .file_utils import (
     build_tree,
     char_display_width,
@@ -237,7 +238,10 @@ def _normalize_block(
     strip_docs: bool = False,
     block_cache: _BlockCache | None = None,
 ) -> list[str]:
-    opts_sig = f"{tab_size}|{max_cols}|{int(compact)}|{int(wrap)}|{int(strip_docs)}"
+    opts_sig = (
+        f"{ONEPDF_BLOCK_SCHEMA_VERSION}|{f.language}|{tab_size}|{max_cols}|"
+        f"{int(compact)}|{int(wrap)}|{int(strip_docs)}"
+    )
     if block_cache is not None:
         cached = block_cache.load(f.git_blob, opts_sig)
         if cached is not None:

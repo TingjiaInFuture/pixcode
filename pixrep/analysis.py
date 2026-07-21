@@ -13,6 +13,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+from .constants import LINT_CACHE_SCHEMA_VERSION
 from .file_utils import normalize_posix_path
 from .js_parser import build_js_semantic_map
 from .lint_collector import iter_target_batches, ruff_severity
@@ -219,7 +220,10 @@ class CodeInsightEngine:
         misses: list[tuple[str, FileInfo]] = []
         for rel, info in rel_files:
             blob = info.git_blob or f"ns{info.mtime_ns}|sz{info.size}"
-            cached = self._load_per_file_lint(cache_dir / f"{blob}.json", tool)
+            # Key on (rel, blob): per-file-ignores / overrides can make two
+            # files with identical content lint differently.
+            key = hashlib.sha256(f"{rel}\0{blob}".encode()).hexdigest()
+            cached = self._load_per_file_lint(cache_dir / f"{key}.json", tool)
             if cached is None:
                 misses.append((rel, info))
             else:
@@ -229,8 +233,9 @@ class CodeInsightEngine:
             fresh = run_batch([rel for rel, _ in misses], deadline)
             for rel, info in misses:
                 blob = info.git_blob or f"ns{info.mtime_ns}|sz{info.size}"
+                key = hashlib.sha256(f"{rel}\0{blob}".encode()).hexdigest()
                 file_issues = fresh.get(rel, [])
-                self._save_per_file_lint(cache_dir / f"{blob}.json", tool, file_issues)
+                self._save_per_file_lint(cache_dir / f"{key}.json", tool, file_issues)
                 issues[rel].extend(file_issues)
         return dict(issues)
 
@@ -298,7 +303,9 @@ class CodeInsightEngine:
     def _per_file_cache_dir(self, tool: str) -> Path:
         # options_hash already folds in the linter version + config signature,
         # so it forms the per-config namespace for lint caches.
-        config_hash = hashlib.sha1(f"{tool}|{self._options_hash}".encode()).hexdigest()[:16]
+        config_hash = hashlib.sha1(
+            f"{tool}|{LINT_CACHE_SCHEMA_VERSION}|{self._options_hash}".encode()
+        ).hexdigest()[:16]
         d = self._lint_cache_dir / tool / config_hash
         d.mkdir(parents=True, exist_ok=True)
         return d

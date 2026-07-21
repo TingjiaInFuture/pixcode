@@ -36,7 +36,9 @@ class TestP0Correctness(unittest.TestCase):
             gen = self._make_gen(d, [info])
             name = gen._file_out_name(info)
             self.assertNotIn("007", name)
-            self.assertEqual(name, "a.py.pdf")
+            # Stable name + short path-hash suffix (collision avoidance).
+            self.assertTrue(name.startswith("a.py__"))
+            self.assertTrue(name.endswith(".pdf"))
 
     def test_needs_regeneration_on_working_tree_change(self):
         # P0-1: a change in the working-tree content hash (not the git index

@@ -92,3 +92,9 @@ DEFAULT_IGNORE_PATTERNS = [
     ".gitignore",
     ".gitattributes",
 ]
+
+# Cache / output schema versions. Bumping a version invalidates the matching
+# caches so an upgrade never silently reuses stale results.
+RENDER_SCHEMA_VERSION = 2
+LINT_CACHE_SCHEMA_VERSION = 2
+ONEPDF_BLOCK_SCHEMA_VERSION = 2

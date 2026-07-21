@@ -99,7 +99,9 @@ class PDFGenerator:
             ext = self.output_format
         safe_path = str(info.path).replace("/", "_").replace("\\", "_")
         safe_path = re.sub(r"[^\w\-_.]", "_", safe_path)
-        return f"{safe_path}.{ext}"
+        # Append a short path hash so a/b_c.py and a_b/c.py don't collide.
+        path_hash = hashlib.sha1(str(info.path).encode("utf-8")).hexdigest()[:8]
+        return f"{safe_path}__{path_hash}.{ext}"
 
     def _file_pdf_name(self, info: FileInfo) -> str:
         """返回输出文件名（使用当前 output_format 后缀）。"""
@@ -136,6 +138,8 @@ class PDFGenerator:
         self.insight_engine.enrich_files(pending)
 
         rendered_outputs: dict[str, list[str]] = {}
+        failed_rels: set[str] = set()
+        success_count = 0
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = {pool.submit(self._generate_file_output, info): info for info in pending}
             total = len(futures)
@@ -143,15 +147,17 @@ class PDFGenerator:
                 info = futures[fut]
                 exc = fut.exception()
                 if exc:
+                    failed_rels.add(normalize_posix_path(info.path))
                     log.warning("  Failed to generate %s for %s: %s", fmt_label, info.path, exc)
                 else:
                     rendered_outputs[normalize_posix_path(info.path)] = fut.result() or []
+                    success_count += 1
                 if index % 10 == 0 or index == total:
                     log.info("  Progress: %d/%d files", index, total)
 
-        self._save_manifest(manifest, rendered_outputs)
+        self._save_manifest(manifest, rendered_outputs, failed_rels)
         log.info("")
-        log.info("Done! Generated %d %ss (+ index)", len(pending), fmt_label)
+        log.info("Done! Generated %d %ss (+ index)", success_count, fmt_label)
 
     def generate_index_only(self) -> None:
         """Generate only the index file into output_dir."""
@@ -180,14 +186,20 @@ class PDFGenerator:
         return any(not (self.output_dir / name).exists() for name in entry.outputs)
 
     def _save_manifest(
-        self, manifest: BuildManifest, rendered_outputs: dict[str, list[str]]
+        self,
+        manifest: BuildManifest,
+        rendered_outputs: dict[str, list[str]],
+        failed_rels: set[str] | None = None,
     ) -> None:
         """Persist file fingerprints + options hash, and prune stale entries.
 
         Removes manifest entries for deleted source files (and their output
         files), and updates re-rendered files with their actual output list
-        (P0-3/P0-4).
+        (P0-3/P0-4). Files whose render failed keep their previous entry
+        verbatim (never stamp the new content hash), so the next run re-attempts.
         """
+        if failed_rels is None:
+            failed_rels = set()
         manifest.pixrep_version = __version__
         manifest.options_hash = self.repo.options_hash
 
@@ -199,6 +211,10 @@ class PDFGenerator:
 
         for info in self.repo.files:
             rel = normalize_posix_path(info.path)
+            if rel in failed_rels:
+                # Render failed: leave the previous entry untouched so the next
+                # run re-attempts (git_blob mismatch). Never write the new hash.
+                continue
             new_outputs = rendered_outputs.get(rel)
             old = manifest.files.get(rel)
             if new_outputs is None:
