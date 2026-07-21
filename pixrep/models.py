@@ -32,8 +32,12 @@ class FileInfo:
     line_count: int = 0
     content: str = field(default="", repr=False)
     index: int = 0
-    # Content fingerprint: git stage OID (git repos) or sha1(content) fallback.
+    # Content fingerprint of the working-tree bytes (sha256). Used for cache
+    # identity and incremental builds — NOT the git index OID, which can lag
+    # uncommitted edits and make --incremental skip changed files (P0-1).
     git_blob: str | None = None
+    # Git index/staging OID; auxiliary only, not used for cache identity.
+    git_index_oid: str | None = None
     semantic_map: SemanticMap = field(default_factory=SemanticMap)
     lint_issues: list[LintIssue] = field(default_factory=list)
     # Internal cache for lazy-loaded content; None means "not yet read".

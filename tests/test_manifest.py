@@ -36,7 +36,7 @@ class TestManifest(unittest.TestCase):
             path = Path(d) / "manifest.json"
             m = BuildManifest(path=path, pixrep_version="0.8.0", options_hash="abc")
             m.files["src/a.py"] = FileEntry(
-                git_blob="oid1", size=100, output="001_a.py.pdf", mtime_ns=123
+                git_blob="oid1", size=100, outputs=["001_a.py.pdf"], mtime_ns=123
             )
             m.save()
             self.assertTrue(path.exists())
@@ -48,7 +48,7 @@ class TestManifest(unittest.TestCase):
             entry = loaded.files["src/a.py"]
             self.assertEqual(entry.git_blob, "oid1")
             self.assertEqual(entry.size, 100)
-            self.assertEqual(entry.output, "001_a.py.pdf")
+            self.assertEqual(entry.outputs, ["001_a.py.pdf"])
 
     def test_manifest_load_missing_returns_empty(self):
         with tempfile.TemporaryDirectory() as d:

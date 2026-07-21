@@ -127,7 +127,7 @@ def compute_options_hash(
 class FileEntry:
     git_blob: str
     size: int
-    output: str
+    outputs: list[str] = field(default_factory=list)
     mtime_ns: int = -1
 
 
@@ -154,10 +154,14 @@ class BuildManifest:
         for rel, entry in (raw.get("files") or {}).items():
             if not isinstance(entry, dict):
                 continue
+            outputs = entry.get("outputs")
+            if not outputs and entry.get("output"):
+                # Backward compat with the legacy single-output schema.
+                outputs = [entry["output"]]
             manifest.files[str(rel)] = FileEntry(
                 git_blob=str(entry.get("git_blob", "")),
                 size=int(entry.get("size", 0)),
-                output=str(entry.get("output", "")),
+                outputs=[str(o) for o in (outputs or [])],
                 mtime_ns=int(entry.get("mtime_ns", -1)),
             )
         return manifest
@@ -170,7 +174,7 @@ class BuildManifest:
                 rel: {
                     "git_blob": e.git_blob,
                     "size": e.size,
-                    "output": e.output,
+                    "outputs": e.outputs,
                     "mtime_ns": e.mtime_ns,
                 }
                 for rel, e in self.files.items()

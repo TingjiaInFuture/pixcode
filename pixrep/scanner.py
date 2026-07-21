@@ -173,11 +173,11 @@ class RepoScanner:
         line_count = line_count_from_bytes(blob)
         content = blob.decode(encoding="utf-8", errors="replace") if include_content else ""
 
-        # Content fingerprint: git stage OID when available, else sha1(content)
-        # computed from the bytes already in hand (no extra I/O).
-        git_blob = oid_map.get(rel_posix)
-        if git_blob is None:
-            git_blob = hashlib.sha1(blob).hexdigest()
+        # Content fingerprint of the actual working-tree bytes (P0-1): we hash
+        # what we render, not the git index OID (which can lag uncommitted
+        # edits and cause --incremental to skip changed files).
+        git_blob = hashlib.sha256(blob).hexdigest()
+        git_index_oid = oid_map.get(rel_posix)
 
         info = FileInfo(
             path=rel_path,
@@ -188,6 +188,7 @@ class RepoScanner:
             line_count=line_count,
             content=content,
             git_blob=git_blob,
+            git_index_oid=git_index_oid,
         )
         return ("ok", info)
 

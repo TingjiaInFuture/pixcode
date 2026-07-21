@@ -9,9 +9,12 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,9 +145,36 @@ class RipgrepSearcher:
             return []
 
         matches: list[MatchLocation] = []
+        # Reader thread + deadline so self.timeout bounds wall-clock time even
+        # if rg blocks on a special filesystem (P0-5). The previous
+        # `for line in proc.stdout` was a blocking read with no timeout check.
+        out_q: queue.Queue[str | None] = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                if proc.stdout is not None:
+                    for line in proc.stdout:
+                        out_q.put(line)
+            finally:
+                out_q.put(None)
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + max(1.0, float(self.timeout))
         try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    proc.terminate()
+                    break
+                try:
+                    line = out_q.get(timeout=min(remaining, 0.5))
+                except queue.Empty:
+                    if proc.poll() is not None and out_q.empty():
+                        break
+                    continue
+                if line is None:
+                    break
                 line = line.strip()
                 if not line:
                     continue

@@ -109,8 +109,8 @@ class TestScannerAndOnepdf(unittest.TestCase):
             repo = scanner.scan(include_content=False)
             self.assertEqual(repo.source_mode, "walk")
             self.assertEqual(len(repo.files), 1)
-            # No git → content fingerprint falls back to sha1(content).
-            self.assertEqual(repo.files[0].git_blob, hashlib.sha1(b"hello\n").hexdigest())
+            # No git → content fingerprint is sha256 of working-tree bytes.
+            self.assertEqual(repo.files[0].git_blob, hashlib.sha256(b"hello\n").hexdigest())
         finally:
             shutil.rmtree(root, ignore_errors=True)
 

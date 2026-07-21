@@ -99,7 +99,7 @@ class PDFGenerator:
             ext = self.output_format
         safe_path = str(info.path).replace("/", "_").replace("\\", "_")
         safe_path = re.sub(r"[^\w\-_.]", "_", safe_path)
-        return f"{info.index:03d}_{safe_path}.{ext}"
+        return f"{safe_path}.{ext}"
 
     def _file_pdf_name(self, info: FileInfo) -> str:
         """返回输出文件名（使用当前 output_format 后缀）。"""
@@ -135,18 +135,21 @@ class PDFGenerator:
         # Analyze only the files that actually need (re-)rendering (P0-1).
         self.insight_engine.enrich_files(pending)
 
+        rendered_outputs: dict[str, list[str]] = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = {pool.submit(self._generate_file_output, info): info for info in pending}
             total = len(futures)
             for index, fut in enumerate(as_completed(futures), start=1):
+                info = futures[fut]
                 exc = fut.exception()
                 if exc:
-                    info = futures[fut]
                     log.warning("  Failed to generate %s for %s: %s", fmt_label, info.path, exc)
+                else:
+                    rendered_outputs[normalize_posix_path(info.path)] = fut.result() or []
                 if index % 10 == 0 or index == total:
                     log.info("  Progress: %d/%d files", index, total)
 
-        self._save_manifest(manifest)
+        self._save_manifest(manifest, rendered_outputs)
         log.info("")
         log.info("Done! Generated %d %ss (+ index)", len(pending), fmt_label)
 
@@ -158,42 +161,69 @@ class PDFGenerator:
     def _needs_regeneration(self, info: FileInfo, manifest: BuildManifest) -> bool:
         """Return True if the output file must be (re-)generated.
 
-        Uses the build manifest (content fingerprint + options hash + version)
-        instead of a raw mtime comparison, so that editing rendering options or
-        bumping pixrep correctly invalidates stale outputs.
+        Identity is the working-tree content fingerprint (sha256, P0-1) plus the
+        options hash and version — not mtime, and not the git index OID. For
+        multi-output files (PNG split) every declared output must still exist.
         """
         if not self.incremental:
-            return True
-        out_name = self._file_out_name(info)
-        out_path = self.output_dir / out_name
-        if not out_path.exists():
             return True
         entry = manifest.files.get(normalize_posix_path(info.path))
         if entry is None:
             return True
         if entry.git_blob != (info.git_blob or ""):
             return True
-        if entry.output != out_name:
-            return True
         if manifest.options_hash != self.repo.options_hash:
             return True
-        return manifest.pixrep_version != __version__
+        if manifest.pixrep_version != __version__:
+            return True
+        # All previously rendered outputs must still be present on disk.
+        return any(not (self.output_dir / name).exists() for name in entry.outputs)
 
-    def _save_manifest(self, manifest: BuildManifest) -> None:
-        """Persist current file fingerprints + options hash for the next run."""
+    def _save_manifest(
+        self, manifest: BuildManifest, rendered_outputs: dict[str, list[str]]
+    ) -> None:
+        """Persist file fingerprints + options hash, and prune stale entries.
+
+        Removes manifest entries for deleted source files (and their output
+        files), and updates re-rendered files with their actual output list
+        (P0-3/P0-4).
+        """
         manifest.pixrep_version = __version__
         manifest.options_hash = self.repo.options_hash
+
+        current = {normalize_posix_path(f.path) for f in self.repo.files}
+        for rel in list(manifest.files):
+            if rel not in current:
+                self._remove_outputs(manifest.files[rel].outputs)
+                del manifest.files[rel]
+
         for info in self.repo.files:
-            manifest.files[normalize_posix_path(info.path)] = FileEntry(
+            rel = normalize_posix_path(info.path)
+            new_outputs = rendered_outputs.get(rel)
+            old = manifest.files.get(rel)
+            if new_outputs is None:
+                # Skipped this run: keep the existing output list.
+                new_outputs = old.outputs if old else [self._file_out_name(info)]
+            elif old:
+                # Re-rendered: drop outputs no longer produced (e.g. fewer PNG
+                # shards after a shrink).
+                self._remove_outputs([o for o in old.outputs if o not in new_outputs])
+            manifest.files[rel] = FileEntry(
                 git_blob=info.git_blob or "",
                 size=info.size,
-                output=self._file_out_name(info),
+                outputs=list(new_outputs),
                 mtime_ns=int(info.mtime_ns),
             )
+
         try:
             manifest.save()
         except OSError:
             log.debug("failed to save manifest", exc_info=True)
+
+    def _remove_outputs(self, names: list[str]) -> None:
+        for name in names:
+            with contextlib.suppress(OSError):
+                (self.output_dir / name).unlink(missing_ok=True)
 
     def _theme_fingerprint(self) -> str:
         items = sorted((k, str(v.hexval())) for k, v in COLORS.items())
@@ -231,8 +261,8 @@ class PDFGenerator:
             bottomMargin=15 * mm,
         )
 
-    def _build_and_save(self, story: list, out_path: Path) -> None:
-        """构建 PDF 并根据 output_format 保存为 PDF 或 PNG。
+    def _build_and_save(self, story: list, out_path: Path) -> list[str]:
+        """构建 PDF 并根据 output_format 保存为 PDF 或 PNG，返回输出文件名列表。
 
         PDF 直接写盘。PNG 先把 PDF 写入临时文件再渲染（避免在内存中保留
         完整 PDF 字节副本），并在渲染前预缩放以限制峰值内存（P0-3）。
@@ -240,7 +270,7 @@ class PDFGenerator:
         if self.output_format == "pdf":
             doc = self._make_doc(out_path)
             doc.build(story, onFirstPage=self._page_footer, onLaterPages=self._page_footer)
-            return
+            return [out_path.name]
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -260,10 +290,14 @@ class PDFGenerator:
 
         if len(images) == 1:
             out_path.write_bytes(next(iter(images.values())))
-        else:
-            stem = out_path.stem
-            for name, data in images.items():
-                out_path.with_name(f"{stem}_{name}.png").write_bytes(data)
+            return [out_path.name]
+        stem = out_path.stem
+        names: list[str] = []
+        for name, data in images.items():
+            fname = f"{stem}_{name}.png"
+            out_path.with_name(fname).write_bytes(data)
+            names.append(fname)
+        return names
 
     def _cjk_style(self, name, parent_name="Normal", **kwargs):
         styles = getSampleStyleSheet()
@@ -288,19 +322,20 @@ class PDFGenerator:
     def _build_index_story(self) -> list:
         return build_index_story(self)
 
-    def _generate_file_output(self, file_info: FileInfo):
-        """生成单个源文件的输出（PDF 或 PNG）。"""
+    def _generate_file_output(self, file_info: FileInfo) -> list[str]:
+        """生成单个源文件的输出（PDF 或 PNG），返回输出文件名列表。"""
         out_name = self._file_out_name(file_info)
         out_path = self.output_dir / out_name
         if self.output_format == "pdf" and file_info.size >= self.streaming_file_threshold:
             # Large files: render directly on a canvas without holding the full
             # Platypus story in memory (P1-5).
-            self._render_file_direct(file_info, out_path)
+            outputs = self._render_file_direct(file_info, out_path)
         else:
             story = self._build_file_story(file_info)
-            self._build_and_save(story, out_path)
+            outputs = self._build_and_save(story, out_path)
         file_info.release_content()
         log.info("  %s (%d lines)", out_name, file_info.line_count)
+        return outputs
 
     def _build_file_story(self, file_info: FileInfo) -> list:
         return build_file_story(self, file_info)
@@ -512,10 +547,11 @@ class PDFGenerator:
                 False,
             )
 
-    def _render_file_direct(self, file_info: FileInfo, out_path: Path) -> None:
+    def _render_file_direct(self, file_info: FileInfo, out_path: Path) -> list[str]:
         """Render a file PDF directly on a canvas, page by page, without
         building the full Platypus story in memory (P1-5)."""
         DirectCodeRenderer(self).render(file_info, out_path)
+        return [out_path.name]
 
     @staticmethod
     def _line_heat_map(info: FileInfo) -> dict[int, str]:
