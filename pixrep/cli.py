@@ -337,7 +337,7 @@ Examples:
         )
         p.add_argument(
             "--order",
-            choices=["importance", "path"],
+            choices=["importance", "path", "dependency"],
             default="importance",
             help="File ordering (default: importance) / 文件排序",
         )

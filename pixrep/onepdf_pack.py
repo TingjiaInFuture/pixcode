@@ -308,6 +308,50 @@ def _importance_key(f: PackedFile) -> tuple[int, str]:
     return (-score, f.rel_posix)
 
 
+def _module_name(rel_posix: str) -> str:
+    """pixrep/scanner.py -> pixrep.scanner; pixrep/__init__.py -> pixrep."""
+    stem = rel_posix[:-3] if rel_posix.endswith(".py") else rel_posix
+    parts = [p for p in stem.split("/") if p]
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _python_imports(content: str) -> set[str]:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return set()
+    mods: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                mods.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            mods.add(node.module.split(".")[0])
+    return mods
+
+
+def _dependency_order(files: list[PackedFile]) -> None:
+    """Order files so widely-depended-on Python modules come first (an
+    approximation of import-topological order; non-Python falls back to
+    importance). Reads Python sources to resolve imports."""
+    mod_to_rel = {_module_name(f.rel_posix): f.rel_posix for f in files if f.language == "python"}
+    popularity = {f.rel_posix: 0 for f in files}
+    for f in files:
+        if f.language != "python":
+            continue
+        try:
+            content = f.abs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for imp in _python_imports(content):
+            rel = mod_to_rel.get(imp)
+            if rel and rel != f.rel_posix:
+                popularity[rel] += 1
+    files.sort(key=lambda f: (-popularity[f.rel_posix], _importance_key(f)))
+
+
 def pack_repo_to_one_pdf(
     repo_root: Path,
     out_pdf: Path,
@@ -344,7 +388,12 @@ def pack_repo_to_one_pdf(
         prefer_git=prefer_git,
         include_patterns=include_patterns,
     )
-    files.sort(key=_importance_key if order == "importance" else lambda x: (x.rel_posix,))
+    if order == "dependency":
+        _dependency_order(files)
+    elif order == "importance":
+        files.sort(key=_importance_key)
+    else:
+        files.sort(key=lambda x: (x.rel_posix,))
 
     compact = profile in {"compact", "semantic"}
     strip_docs = profile == "semantic"
