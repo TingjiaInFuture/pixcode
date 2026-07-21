@@ -324,6 +324,23 @@ Examples:
             help="Disable line wrapping / 禁用自动换行",
         )
         p.add_argument(
+            "--profile",
+            choices=["compact", "lossless"],
+            default="compact",
+            help="Content profile (default: compact) / 内容压缩档",
+        )
+        p.add_argument(
+            "--deterministic",
+            action="store_true",
+            help="Omit timestamp + fix metadata for reproducible output / 确定性输出",
+        )
+        p.add_argument(
+            "--order",
+            choices=["importance", "path"],
+            default="importance",
+            help="File ordering (default: importance) / 文件排序",
+        )
+        p.add_argument(
             "--no-tree",
             action="store_true",
             help="Do not include directory tree section / 不包含目录树",
@@ -510,6 +527,9 @@ def _run_onepdf(args: argparse.Namespace) -> int:
         tab_size=args.tab_size,
         include_tree=not args.no_tree,
         include_index=not args.no_index,
+        profile=args.profile,
+        deterministic=args.deterministic,
+        order=args.order,
     )
     log.info(
         "onepdf summary: seen=%d, included=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d, pages=%d, output=%d bytes",

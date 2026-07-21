@@ -28,16 +28,40 @@ class StreamingPDFWriter:
     finalize so a mid-run crash never corrupts the previous good output.
     """
 
-    def __init__(self, title: str, out_path: Path, fonts: FontRegistry | None = None):
+    def __init__(
+        self,
+        title: str,
+        out_path: Path,
+        fonts: FontRegistry | None = None,
+        deterministic: bool = False,
+    ):
         self.title = title
         self.out_path = out_path
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         self._fonts = fonts or register_fonts()
+        # A real CJK font is registered (vs the built-in Courier fallback).
+        self._cjk_active = self._fonts.mono not in {"Courier"}
+        self._deterministic = deterministic
         self._tmp_path = out_path.with_name(out_path.name + ".tmp")
-        self._canvas = canvas.Canvas(str(self._tmp_path), pagesize=A4, pageCompression=1)
+        # invariant=1 makes reportlab emit fixed timestamps / doc-id so two
+        # runs over identical input produce byte-identical output.
+        self._canvas = canvas.Canvas(
+            str(self._tmp_path), pagesize=A4, pageCompression=1, invariant=deterministic
+        )
         self._canvas.setTitle(title)
+        if deterministic:
+            self._canvas.setCreator("pixrep")
+            self._canvas.setAuthor("pixrep")
+            self._canvas.setSubject("pixrep ONEPDF_CORE")
         _, self._page_height = A4
         self.page_count = 0
+
+    def _font_for_line(self, line: str) -> str:
+        # ASCII-only lines render with the built-in Courier (no CJK embedding);
+        # lines containing non-ASCII fall back to the registered CJK mono font.
+        if self._cjk_active and line.isascii():
+            return "Courier"
+        return self._fonts.mono
 
     def add_page_lines(
         self,
@@ -50,9 +74,9 @@ class StreamingPDFWriter:
     ) -> None:
         text = self._canvas.beginText()
         text.setTextOrigin(start_x, self._page_height - top_margin - font_size)
-        text.setFont(self._fonts.mono, font_size)
         text.setLeading(leading)
         for line in lines:
+            text.setFont(self._font_for_line(line), font_size)
             text.textLine(line)
         self._canvas.drawText(text)
         self._canvas.showPage()

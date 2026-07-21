@@ -158,6 +158,33 @@ def _wrap_line(line: str, max_cols: int) -> list[str]:
     return result
 
 
+def _importance_key(f: PackedFile) -> tuple[int, str]:
+    """Sort key: higher importance first. README/manifest/entrypoints before
+    library/utility code; shallower paths before deeper ones; ties broken by
+    path for determinism."""
+    rel = f.rel_posix.lower()
+    name = rel.rsplit("/", 1)[-1]
+    score = 0
+    if "readme" in name:
+        score += 100
+    if name in {
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "package.json",
+        "cargo.toml",
+        "go.mod",
+        "pom.xml",
+    }:
+        score += 90
+    if name.startswith(("cli", "main", "app", "__init__", "index")):
+        score += 70
+    if name.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java")):
+        score += 30
+    score -= rel.count("/") * 2
+    return (-score, f.rel_posix)
+
+
 def pack_repo_to_one_pdf(
     repo_root: Path,
     out_pdf: Path,
@@ -171,11 +198,19 @@ def pack_repo_to_one_pdf(
     tab_size: int = 2,
     include_tree: bool = True,
     include_index: bool = True,
+    profile: str = "compact",
+    deterministic: bool = False,
+    order: str = "importance",
 ) -> dict[str, int]:
     """Pack repository files into a single minimized PDF (ONEPDF_CORE).
 
-    Lines are emitted one at a time and flushed into page streams without
-    ever building the full line list in memory (streaming approach).
+    Streaming: lines are emitted one at a time and flushed without ever
+    building the full line list in memory.
+
+    profile="compact" squeezes blank lines, strips trailing whitespace and
+    uses a compact ``@@ <path> <lang>`` header; "lossless" keeps the original
+    formatting and verbose headers. ``deterministic`` omits the generation
+    timestamp and fixes PDF metadata. ``order`` controls file ordering.
     """
     files, stats = collect_core_files(
         repo_root=repo_root,
@@ -185,16 +220,23 @@ def pack_repo_to_one_pdf(
         prefer_git=prefer_git,
         include_patterns=include_patterns,
     )
+    files.sort(key=_importance_key if order == "importance" else lambda x: (x.rel_posix,))
+
+    compact = profile == "compact"
 
     font_size = 7
-    leading = 9  # points
+    leading = 9
     top = 36
     bottom = 36
     page_height = 842
     max_lines = max(1, int((page_height - top - bottom) / leading))
 
     current: list[str] = []
-    writer = StreamingPDFWriter(title=f"{repo_root.name} onepdf", out_path=out_pdf)
+    writer = StreamingPDFWriter(
+        title=f"{repo_root.name} onepdf",
+        out_path=out_pdf,
+        deterministic=deterministic,
+    )
 
     def flush_page() -> None:
         if not current:
@@ -210,7 +252,8 @@ def pack_repo_to_one_pdf(
     # ── Header ────────────────────────────────────────────────────────
     emit("pixrep onepdf")
     emit(f"repo: {repo_root.name}")
-    emit(f"generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if not deterministic:
+        emit(f"generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     emit(f"files: {len(files)}")
     emit("")
 
@@ -224,7 +267,10 @@ def pack_repo_to_one_pdf(
     if include_index:
         emit("== index ==")
         for idx, f in enumerate(files, start=1):
-            emit(f"{idx:04d}  {f.rel_posix}  ({f.line_count} lines, {f.size} bytes)")
+            if compact:
+                emit(f"{idx:04d} {f.rel_posix}")
+            else:
+                emit(f"{idx:04d}  {f.rel_posix}  ({f.line_count} lines, {f.size} bytes)")
         emit("")
 
     emit("== files ==")
@@ -232,18 +278,31 @@ def pack_repo_to_one_pdf(
 
     # ── File content ──────────────────────────────────────────────────
     for idx, f in enumerate(files, start=1):
-        header = f"[{idx:04d}] {f.rel_posix}  ({f.language}, {f.line_count} lines, {f.size} bytes)"
-        emit(header)
-        emit("-" * min(max_cols, max(10, len(header))))
+        if compact:
+            emit(f"@@ {f.rel_posix} {f.language}")
+        else:
+            header = (
+                f"[{idx:04d}] {f.rel_posix}  ({f.language}, {f.line_count} lines, {f.size} bytes)"
+            )
+            emit(header)
+            emit("-" * min(max_cols, max(10, len(header))))
         try:
             src = f.abs_path.open("r", encoding="utf-8", errors="replace")
         except OSError:
             emit("(read failed)")
             emit("")
             continue
+        prev_blank = False
         with src:
             for raw_line in src:
-                safe_line = _ascii_safe(raw_line.rstrip(), tab_size)
+                line = raw_line.rstrip("\n")
+                if compact:
+                    line = line.rstrip()
+                    is_blank = not line
+                    if is_blank and prev_blank:
+                        continue
+                    prev_blank = is_blank
+                safe_line = _ascii_safe(line, tab_size)
                 if wrap:
                     for chunk in _wrap_line(safe_line, max_cols):
                         emit(chunk)
