@@ -1,3 +1,4 @@
+import hashlib
 import io
 import logging
 import os
@@ -15,12 +16,15 @@ from reportlab.platypus import (
 )
 
 from .analysis import CodeInsightEngine
+from .file_utils import normalize_posix_path
 from .flowables import CodeBlockChunk
 from .fonts import FontRegistry, register_fonts
+from .manifest import BuildManifest, FileEntry, compute_options_hash
 from .models import FileInfo, RepoInfo
 from .pdf_story_builders import build_file_story, build_index_story
 from .theme import COLORS
 from .utils import xml_escape
+from .version import __version__
 
 
 log = logging.getLogger(__name__)
@@ -52,6 +56,19 @@ class PDFGenerator:
         self.output_format = output_format
         self.png_dpi = png_dpi
         self.streaming_file_threshold = 256 * 1024
+        # Fingerprint the rendering/cache options so that changing theme, font,
+        # DPI, format, semantic/lint toggles, linter version/config or pixrep
+        # version invalidates stale semantic/lint caches and rendered outputs.
+        self.repo.options_hash = compute_options_hash(
+            theme_id=self._theme_fingerprint(),
+            font_id=self._font_fingerprint(),
+            png_dpi=png_dpi,
+            output_format=output_format,
+            enable_semantic=enable_semantic_minimap,
+            enable_lint=enable_lint_heatmap,
+            syntax_mode="full",
+            repo_root=self.repo.root,
+        )
         self.insight_engine = CodeInsightEngine(
             repo,
             enable_semantic_minimap=enable_semantic_minimap,
@@ -72,7 +89,12 @@ class PDFGenerator:
         return self._file_out_name(info)
 
     def generate_all(self):
-        """Generate index + one output file per source file into output_dir."""
+        """Generate index + one output file per source file into output_dir.
+
+        Execution order (P0-1): compute pending from the manifest first, render
+        the index (it does not need semantic/lint), analyze only the pending
+        files, render them, then persist the manifest.
+        """
         fmt_label = self.output_format.upper()
         log.info("")
         log.info("Project: %s", self.repo.name)
@@ -82,16 +104,22 @@ class PDFGenerator:
         if self.incremental:
             log.info("Mode: incremental (skipping up-to-date files)")
         log.info("")
-        self.insight_engine.enrich_repo()
-        self._generate_index()
 
+        manifest = BuildManifest.load(self.insight_engine.manifest_path)
         pending = [
             info for info in self.repo.files
-            if self._needs_regeneration(info)
+            if self._needs_regeneration(info, manifest)
         ]
         skipped = len(self.repo.files) - len(pending)
         if skipped:
             log.info("  Skipping %d up-to-date file %ss", skipped, fmt_label)
+
+        # The index only depends on the file list/stats, not on semantic or
+        # lint results, so it can be rendered before analysis.
+        self._generate_index()
+
+        # Analyze only the files that actually need (re-)rendering (P0-1).
+        self.insight_engine.enrich_files(pending)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = {pool.submit(self._generate_file_output, info): info for info in pending}
@@ -104,6 +132,7 @@ class PDFGenerator:
                 if index % 10 == 0 or index == total:
                     log.info("  Progress: %d/%d files", index, total)
 
+        self._save_manifest(manifest)
         log.info("")
         log.info("Done! Generated %d %ss (+ index)", len(pending), fmt_label)
 
@@ -112,17 +141,57 @@ class PDFGenerator:
         self.insight_engine.enrich_repo()
         self._generate_index()
 
-    def _needs_regeneration(self, info: FileInfo) -> bool:
-        """Return True if the output file must be (re-)generated."""
+    def _needs_regeneration(self, info: FileInfo, manifest: BuildManifest) -> bool:
+        """Return True if the output file must be (re-)generated.
+
+        Uses the build manifest (content fingerprint + options hash + version)
+        instead of a raw mtime comparison, so that editing rendering options or
+        bumping pixrep correctly invalidates stale outputs.
+        """
         if not self.incremental:
             return True
-        out_path = self.output_dir / self._file_out_name(info)
+        out_name = self._file_out_name(info)
+        out_path = self.output_dir / out_name
         if not out_path.exists():
             return True
-        try:
-            return info.abs_path.stat().st_mtime > out_path.stat().st_mtime
-        except OSError:
+        entry = manifest.files.get(normalize_posix_path(info.path))
+        if entry is None:
             return True
+        if entry.git_blob != (info.git_blob or ""):
+            return True
+        if entry.output != out_name:
+            return True
+        if manifest.options_hash != self.repo.options_hash:
+            return True
+        if manifest.pixrep_version != __version__:
+            return True
+        return False
+
+    def _save_manifest(self, manifest: BuildManifest) -> None:
+        """Persist current file fingerprints + options hash for the next run."""
+        manifest.pixrep_version = __version__
+        manifest.options_hash = self.repo.options_hash
+        for info in self.repo.files:
+            manifest.files[normalize_posix_path(info.path)] = FileEntry(
+                git_blob=info.git_blob or "",
+                size=info.size,
+                output=self._file_out_name(info),
+                mtime_ns=int(info.mtime_ns),
+            )
+        try:
+            manifest.save()
+        except OSError:
+            log.debug("failed to save manifest", exc_info=True)
+
+    def _theme_fingerprint(self) -> str:
+        items = sorted((k, str(v.hexval())) for k, v in COLORS.items())
+        return hashlib.sha1(repr(items).encode("utf-8")).hexdigest()[:12]
+
+    def _font_fingerprint(self) -> str:
+        f = self.fonts
+        return hashlib.sha1(
+            repr((f.normal, f.bold, f.mono, f.mono_bold)).encode("utf-8")
+        ).hexdigest()[:12]
 
     def _page_footer(self, canvas, doc):
         canvas.saveState()

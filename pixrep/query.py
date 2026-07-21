@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -239,8 +240,8 @@ class SemanticSearcher:
         self.repo = repo
         self.max_results = max_results
         self._cache_root = self._resolve_cache_root()
-        self._cache_root.mkdir(parents=True, exist_ok=True)
-        self._index_path = self._cache_root / "symbol_index.json"
+        self._files_cache_dir = self._cache_root / "files"
+        self._files_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _resolve_cache_root(self) -> Path:
         env = os.environ.get("PIXREP_CACHE_DIR", "").strip()
@@ -286,99 +287,87 @@ class SemanticSearcher:
         return out
 
     def _load_or_build_symbol_index(self) -> list[SymbolEntry]:
-        signatures: dict[str, dict[str, int]] = {}
-        for info in self.repo.files:
-            if info.language != "python":
-                continue
-            rel = normalize_posix_path(info.path)
-            try:
-                st = info.abs_path.stat()
-                signatures[rel] = {"mtime_ns": int(st.st_mtime_ns), "size": int(st.st_size)}
-            except OSError:
-                signatures[rel] = {"mtime_ns": -1, "size": -1}
+        """Build the symbol index reusing per-file caches (P1-1).
 
-        cached = self._read_symbol_cache()
-        if cached is not None:
-            cached_sigs, cached_entries = cached
-            if cached_sigs == signatures:
-                return cached_entries
-
-        fresh = self._build_symbol_index()
-        self._write_symbol_cache(signatures, fresh)
-        return fresh
-
-    def _build_symbol_index(self) -> list[SymbolEntry]:
+        Only Python files whose content fingerprint changed are re-parsed;
+        unchanged files reuse their cached symbol entries.
+        """
         entries: list[SymbolEntry] = []
         for info in self.repo.files:
             if info.language != "python":
                 continue
             rel = normalize_posix_path(info.path)
+            blob = info.git_blob or f"ns{info.mtime_ns}|sz{info.size}"
+            key = self._file_cache_key(rel, blob)
+            cache_path = self._files_cache_dir / f"{key}.json"
 
-            try:
-                content = info.load_content().lstrip("\ufeff")
-                tree = ast.parse(content)
-            except (SyntaxError, OSError):
-                continue
+            file_entries = self._load_file_cache(cache_path)
+            if file_entries is None:
+                file_entries = self._build_symbols_for_file(info, rel)
+                self._write_file_cache(cache_path, rel, blob, file_entries)
+            entries.extend(file_entries)
 
-            lines = content.split("\n")
-            class_by_node: dict[int, str] = {}
-            for parent in ast.walk(tree):
-                if isinstance(parent, ast.ClassDef):
-                    for child in parent.body:
-                        class_by_node[id(child)] = parent.name
-
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ClassDef):
-                    line_no = max(1, int(getattr(node, "lineno", 1)))
-                    entries.append(
-                        SymbolEntry(
-                            rel_path=rel,
-                            line_number=line_no,
-                            line_text=_line_at(lines, line_no),
-                            name=node.name,
-                            qualified=node.name,
-                            kind="class",
-                        )
-                    )
-                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    owner = class_by_node.get(id(node), "")
-                    qualified = f"{owner}.{node.name}" if owner else node.name
-                    line_no = max(1, int(getattr(node, "lineno", 1)))
-                    entries.append(
-                        SymbolEntry(
-                            rel_path=rel,
-                            line_number=line_no,
-                            line_text=_line_at(lines, line_no),
-                            name=node.name,
-                            qualified=qualified,
-                            kind="function",
-                        )
-                    )
         entries.sort(key=lambda e: (e.rel_path, e.line_number, e.kind, e.qualified))
         return entries
 
-    def _read_symbol_cache(self) -> tuple[dict[str, dict[str, int]], list[SymbolEntry]] | None:
-        if not self._index_path.exists():
+    @staticmethod
+    def _file_cache_key(rel: str, blob: str) -> str:
+        return hashlib.sha1(f"{rel}|{blob}".encode("utf-8")).hexdigest()
+
+    def _build_symbols_for_file(self, info: FileInfo, rel: str) -> list[SymbolEntry]:
+        try:
+            content = info.load_content().lstrip("\ufeff")
+            tree = ast.parse(content)
+        except (SyntaxError, OSError):
+            return []
+
+        lines = content.split("\n")
+        class_by_node: dict[int, str] = {}
+        for parent in ast.walk(tree):
+            if isinstance(parent, ast.ClassDef):
+                for child in parent.body:
+                    class_by_node[id(child)] = parent.name
+
+        file_entries: list[SymbolEntry] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                line_no = max(1, int(getattr(node, "lineno", 1)))
+                file_entries.append(
+                    SymbolEntry(
+                        rel_path=rel,
+                        line_number=line_no,
+                        line_text=_line_at(lines, line_no),
+                        name=node.name,
+                        qualified=node.name,
+                        kind="class",
+                    )
+                )
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                owner = class_by_node.get(id(node), "")
+                qualified = f"{owner}.{node.name}" if owner else node.name
+                line_no = max(1, int(getattr(node, "lineno", 1)))
+                file_entries.append(
+                    SymbolEntry(
+                        rel_path=rel,
+                        line_number=line_no,
+                        line_text=_line_at(lines, line_no),
+                        name=node.name,
+                        qualified=qualified,
+                        kind="function",
+                    )
+                )
+        return file_entries
+
+    def _load_file_cache(self, cache_path: Path) -> list[SymbolEntry] | None:
+        if not cache_path.exists():
             return None
         try:
-            payload = json.loads(self._index_path.read_text(encoding="utf-8"))
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-
-        sigs_raw = payload.get("files", {})
-        entries_raw = payload.get("entries", [])
-        if not isinstance(sigs_raw, dict) or not isinstance(entries_raw, list):
+        entries_raw = payload.get("entries")
+        if not isinstance(entries_raw, list):
             return None
-
-        signatures: dict[str, dict[str, int]] = {}
-        for rel, sig in sigs_raw.items():
-            if not isinstance(sig, dict):
-                continue
-            signatures[str(rel)] = {
-                "mtime_ns": int(sig.get("mtime_ns", -1)),
-                "size": int(sig.get("size", -1)),
-            }
-
         entries: list[SymbolEntry] = []
         for item in entries_raw:
             if not isinstance(item, dict):
@@ -393,11 +382,18 @@ class SemanticSearcher:
                     kind=str(item.get("kind", "symbol")),
                 )
             )
-        return signatures, entries
+        return entries
 
-    def _write_symbol_cache(self, signatures: dict[str, dict[str, int]], entries: list[SymbolEntry]) -> None:
+    def _write_file_cache(
+        self,
+        cache_path: Path,
+        rel: str,
+        blob: str,
+        entries: list[SymbolEntry],
+    ) -> None:
         payload = {
-            "files": signatures,
+            "rel": rel,
+            "blob": blob,
             "entries": [
                 {
                     "rel_path": e.rel_path,
@@ -411,7 +407,7 @@ class SemanticSearcher:
             ],
         }
         try:
-            self._index_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         except OSError:
             return
 

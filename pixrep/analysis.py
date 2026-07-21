@@ -4,9 +4,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -33,11 +35,17 @@ class CodeInsightEngine:
         self.enable_semantic_minimap = enable_semantic_minimap
         self.enable_lint_heatmap = enable_lint_heatmap
         self.linter_timeout = linter_timeout
+        # Rendering/cache identity fingerprint (populated by the generator); an
+        # empty string keeps backward-compatible behaviour for callers that do
+        # not set it.
+        self._options_hash = repo.options_hash
         self._resolved_root = self.repo.root.resolve()
         self._scanned_paths = {self._normalize_path(info.path) for info in self.repo.files}
         self._scanned_paths_ci = {k.lower(): k for k in self._scanned_paths} if os.name == "nt" else {}
-        self._file_meta_by_rel = {
-            self._normalize_path(info.path): (int(info.mtime_ns), int(info.size))
+        # rel -> content fingerprint (git blob OID or sha1), used as the cache
+        # identity for lint (and available for any per-file cache).
+        self._blob_by_rel = {
+            self._normalize_path(info.path): info.git_blob
             for info in self.repo.files
         }
         self._cache_root = self._resolve_cache_root()
@@ -45,6 +53,7 @@ class CodeInsightEngine:
         self._lint_cache_dir = self._cache_root / "lint"
         self._semantic_cache_dir.mkdir(parents=True, exist_ok=True)
         self._lint_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.manifest_path = self._cache_root / "manifest.json"
 
     def _resolve_cache_root(self) -> Path:
         env = os.environ.get("PIXREP_CACHE_DIR", "").strip()
@@ -60,80 +69,79 @@ class CodeInsightEngine:
             return Path(xdg).expanduser().resolve() / "pixrep" / self.repo.name
         return Path.home() / ".cache" / "pixrep" / self.repo.name
 
-    def enrich_repo(self):
-        """Populate semantic maps and lint issues onto RepoInfo.file entries."""
-        semantic_maps: dict[int, SemanticMap] = {}
-        lint_map: dict[str, list[LintIssue]] = {}
+    def enrich_repo(self) -> None:
+        """Populate semantic maps and lint issues onto every repo file."""
+        self.enrich_files(self.repo.files)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as orchestration_pool:
-            lint_future = None
-            semantic_future = None
-            if self.enable_lint_heatmap:
-                lint_future = orchestration_pool.submit(self._collect_lint_issues)
-            if self.enable_semantic_minimap and self.repo.files:
-                semantic_future = orchestration_pool.submit(self._collect_semantic_maps)
+    def enrich_files(self, files: list[FileInfo]) -> None:
+        """Populate semantic maps and lint issues for the given files only.
 
-            if lint_future is not None:
-                try:
-                    lint_map = lint_future.result()
-                except Exception:
-                    lint_map = {}
+        Used by incremental generation so that only pending files pay the
+        analysis cost (P0-1).
+        """
+        if not files:
+            return
 
-            if semantic_future is not None:
-                try:
-                    semantic_maps = semantic_future.result()
-                except Exception:
-                    semantic_maps = {}
-
-        lint_map_ci = {k.lower(): v for k, v in lint_map.items()} if os.name == "nt" else {}
-        matched = 0
-
-        for idx, info in enumerate(self.repo.files):
-            if self.enable_semantic_minimap:
-                info.semantic_map = semantic_maps.get(idx, SemanticMap())
-            else:
+        if self.enable_semantic_minimap:
+            workers = min(4, max(1, os.cpu_count() or 1))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                future_map = {
+                    pool.submit(self._build_semantic_map_cached, info): info
+                    for info in files
+                }
+                for fut in concurrent.futures.as_completed(future_map):
+                    info = future_map[fut]
+                    try:
+                        info.semantic_map = fut.result()
+                    except Exception:
+                        info.semantic_map = SemanticMap(
+                            kind="callgraph",
+                            lines=["(analysis failed)"],
+                            node_count=0,
+                            edge_count=0,
+                        )
+        else:
+            for info in files:
                 info.semantic_map = SemanticMap()
-            key = self._normalize_path(info.path)
-            issues = lint_map.get(key)
-            if issues is None and lint_map_ci:
-                issues = lint_map_ci.get(key.lower())
-            info.lint_issues = issues or []
-            if info.lint_issues:
-                matched += 1
 
-        if self.enable_lint_heatmap and lint_map and matched == 0:
-            log.warning(
-                "Linter found %d files with issues but none matched scanned files. Path normalization mismatch?",
-                len(lint_map),
-            )
-            sample_lint = next(iter(lint_map))
-            sample_file = self._normalize_path(self.repo.files[0].path) if self.repo.files else "(none)"
-            log.debug("sample lint path=%r, sample file path=%r", sample_lint, sample_file)
+        if self.enable_lint_heatmap:
+            lint_map = self._collect_lint_issues(files)
+            lint_map_ci = {k.lower(): v for k, v in lint_map.items()} if os.name == "nt" else {}
+            matched = 0
+            for info in files:
+                key = self._normalize_path(info.path)
+                issues = lint_map.get(key)
+                if issues is None and lint_map_ci:
+                    issues = lint_map_ci.get(key.lower())
+                info.lint_issues = issues or []
+                if info.lint_issues:
+                    matched += 1
 
-    def _collect_semantic_maps(self) -> dict[int, SemanticMap]:
-        semantic_maps: dict[int, SemanticMap] = {}
-        workers = min(4, max(1, os.cpu_count() or 1))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            future_map = {
-                pool.submit(self._build_semantic_map_cached, info): idx
-                for idx, info in enumerate(self.repo.files)
-            }
-            for fut in concurrent.futures.as_completed(future_map):
-                idx = future_map[fut]
-                try:
-                    semantic_maps[idx] = fut.result()
-                except Exception:
-                    semantic_maps[idx] = SemanticMap(kind="callgraph", lines=["(analysis failed)"], node_count=0, edge_count=0)
-        return semantic_maps
+            if lint_map and matched == 0:
+                log.warning(
+                    "Linter found %d files with issues but none matched scanned files. Path normalization mismatch?",
+                    len(lint_map),
+                )
+                sample_lint = next(iter(lint_map))
+                sample_file = self._normalize_path(files[0].path)
+                log.debug("sample lint path=%r, sample file path=%r", sample_lint, sample_file)
+        else:
+            for info in files:
+                info.lint_issues = []
 
-    def _collect_lint_issues(self) -> dict[str, list[LintIssue]]:
+    def _collect_lint_issues(self, files: list[FileInfo]) -> dict[str, list[LintIssue]]:
         issues: dict[str, list[LintIssue]] = defaultdict(list)
+        # Single global deadline shared across ruff + eslint (P1-2). Each batch
+        # checks the remaining time and kills its subprocess on timeout, so the
+        # total wall-clock stays bounded instead of growing as batches × timeout.
+        deadline = time.monotonic() + max(1, self.linter_timeout)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            fut_ruff = pool.submit(self._collect_ruff)
-            fut_eslint = pool.submit(self._collect_eslint)
-            done, not_done = concurrent.futures.wait(
+            fut_ruff = pool.submit(self._collect_ruff, files, deadline)
+            fut_eslint = pool.submit(self._collect_eslint, files, deadline)
+            remaining_wait = max(0.1, deadline - time.monotonic())
+            done, _not_done = concurrent.futures.wait(
                 {fut_ruff, fut_eslint},
-                timeout=max(1, self.linter_timeout * 2),
+                timeout=remaining_wait,
             )
 
             for fut in done:
@@ -144,26 +152,36 @@ class CodeInsightEngine:
                     partial = {}
                 for rel, rel_issues in partial.items():
                     issues[rel].extend(rel_issues)
-
-            for fut in not_done:
-                fut.cancel()
         return dict(issues)
 
-    def _run_json_command(self, cmd: list[str], *, cwd: Path, tool: str):
+    def _run_json_command(self, cmd: list[str], *, cwd: Path, tool: str, timeout: float):
+        """Run a linter command with a hard per-call timeout, killing the
+        subprocess on expiry instead of relying on Future.cancel().
+        """
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 cwd=str(cwd),
-                timeout=self.linter_timeout,
-                check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            log.debug("%s invocation failed or timed out", tool)
+        except OSError:
+            log.debug("%s invocation failed", tool)
             return None
 
-        payload = (proc.stdout or "").strip()
+        try:
+            out, _err = proc.communicate(timeout=max(0.1, timeout))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            log.debug("%s timed out and was killed", tool)
+            return None
+
+        payload = (out or "").strip()
         if not payload:
             return None
         try:
@@ -172,11 +190,11 @@ class CodeInsightEngine:
             log.debug("%s output was not valid json", tool)
             return None
 
-    def _collect_ruff(self) -> dict[str, list[LintIssue]]:
+    def _collect_ruff(self, files: list[FileInfo], deadline: float) -> dict[str, list[LintIssue]]:
         issues: dict[str, list[LintIssue]] = defaultdict(list)
         if not shutil.which("ruff"):
             return {}
-        targets = [self._normalize_path(info.path) for info in self.repo.files if info.language == "python"]
+        targets = [self._normalize_path(info.path) for info in files if info.language == "python"]
         if not targets:
             return {}
 
@@ -186,8 +204,13 @@ class CodeInsightEngine:
             return cached
 
         for batch in iter_target_batches(targets):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             cmd = ["ruff", "check", "--output-format", "json", *batch]
-            data = self._run_json_command(cmd, cwd=self.repo.root, tool="ruff")
+            data = self._run_json_command(
+                cmd, cwd=self.repo.root, tool="ruff", timeout=remaining
+            )
             if not data:
                 continue
             for item in data:
@@ -212,13 +235,13 @@ class CodeInsightEngine:
         self._save_lint_cache("ruff", cache_key, result)
         return result
 
-    def _collect_eslint(self) -> dict[str, list[LintIssue]]:
+    def _collect_eslint(self, files: list[FileInfo], deadline: float) -> dict[str, list[LintIssue]]:
         issues: dict[str, list[LintIssue]] = defaultdict(list)
         if not shutil.which("eslint"):
             return {}
         targets = [
             self._normalize_path(info.path)
-            for info in self.repo.files
+            for info in files
             if info.language in {"javascript", "typescript"}
         ]
         if not targets:
@@ -230,16 +253,21 @@ class CodeInsightEngine:
             return cached
 
         for batch in iter_target_batches(targets):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             cmd = [
                 "eslint",
                 "--format",
                 "json",
                 *batch,
             ]
-            files = self._run_json_command(cmd, cwd=self.repo.root, tool="eslint")
-            if not files:
+            files_json = self._run_json_command(
+                cmd, cwd=self.repo.root, tool="eslint", timeout=remaining
+            )
+            if not files_json:
                 continue
-            for entry in files:
+            for entry in files_json:
                 rel = self._relative_to_repo(entry.get("filePath", ""))
                 if not rel:
                     continue
@@ -359,27 +387,22 @@ class CodeInsightEngine:
 
     def _semantic_cache_key(self, info: FileInfo) -> str:
         rel = self._normalize_path(info.path)
-        mtime_ns = int(info.mtime_ns)
-        size = int(info.size)
-        if mtime_ns < 0 or size < 0:
-            sig = f"{rel}|missing|v2"
-        else:
-            sig = f"{rel}|{mtime_ns}|{size}|v2"
+        blob = info.git_blob
+        if not blob:
+            # Fallback identity for entries without a content fingerprint.
+            blob = f"ns{int(info.mtime_ns)}|sz{int(info.size)}"
+        sig = f"{self._options_hash}|{rel}|{blob}|v3"
         return hashlib.sha1(sig.encode("utf-8")).hexdigest()
 
     def _tool_cache_key(self, tool: str, targets: list[str]) -> str:
         h = hashlib.sha1()
-        h.update(f"{tool}|v2|".encode("utf-8"))
+        h.update(f"{tool}|{self._options_hash}|v3|".encode("utf-8"))
         for rel in sorted(set(targets)):
-            meta = self._file_meta_by_rel.get(rel)
-            if meta is None:
+            blob = self._blob_by_rel.get(rel)
+            if blob:
+                h.update(f"{rel}|{blob}\n".encode("utf-8"))
+            else:
                 h.update(f"{rel}|missing\n".encode("utf-8"))
-                continue
-            mtime_ns, size = meta
-            if mtime_ns < 0 or size < 0:
-                h.update(f"{rel}|missing\n".encode("utf-8"))
-                continue
-            h.update(f"{rel}|{mtime_ns}|{size}\n".encode("utf-8"))
         return h.hexdigest()
 
     def _load_lint_cache(self, tool: str, key: str) -> dict[str, list[LintIssue]] | None:
@@ -456,4 +479,3 @@ class CodeInsightEngine:
         if isinstance(node, ast.Attribute):
             return node.attr
         return ""
-
