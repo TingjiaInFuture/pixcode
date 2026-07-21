@@ -184,6 +184,13 @@ def _wrap_line(line: str, max_cols: int) -> list[str]:
     return result
 
 
+def _byte_col_to_char_col(line: str, byte_col: int) -> int:
+    """AST col_offset is a UTF-8 byte offset; convert to a character index so
+    slicing a str works correctly on lines containing multibyte (e.g. CJK)
+    characters."""
+    return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="replace"))
+
+
 def _strip_python_docstrings(content: str) -> str:
     """AST-safe removal of Python docstrings (module/class/function).
 
@@ -217,16 +224,18 @@ def _strip_python_docstrings(content: str) -> str:
             continue
         # Require the docstring to be alone on its line(s): nothing but
         # whitespace before it on the first line or after it on the last.
-        if lines[first_idx][: doc.col_offset].strip():
+        first_col = _byte_col_to_char_col(lines[first_idx], doc.col_offset)
+        last_col = _byte_col_to_char_col(lines[last_idx], doc.end_col_offset)
+        if lines[first_idx][:first_col].strip():
             continue
-        if lines[last_idx][doc.end_col_offset :].strip():
+        if lines[last_idx][last_col:].strip():
             continue
         for ln in range(doc.lineno, (doc.end_lineno or doc.lineno) + 1):
             drop.add(ln)
         if len(body) == 1 and isinstance(
             node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
         ):
-            indent = lines[first_idx][: doc.col_offset]
+            indent = lines[first_idx][:first_col]
             pass_at[doc.lineno] = f"{indent}pass"
     if not drop:
         return content
@@ -397,22 +406,61 @@ def _python_imports(content: str, current_pkg: str = "") -> set[str]:
     return mods
 
 
-def _dependency_order(files: list[PackedFile]) -> None:
+class _ImportsCache:
+    """Cache of a Python file's resolved imports keyed by its content hash, so
+    --order dependency doesn't re-read + AST-parse every Python file when the
+    snapshot/block caches are warm."""
+
+    def __init__(self, cache_dir: Path | None):
+        self.cache_dir = cache_dir / "imports" if cache_dir else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, blob: str) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / f"{hashlib.sha256(blob.encode('utf-8')).hexdigest()}.json"
+
+    def load(self, blob: str) -> list[str] | None:
+        path = self._path(blob)
+        if path is None or not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, list) else None
+
+    def save(self, blob: str, imports: list[str]) -> None:
+        path = self._path(blob)
+        if path is None:
+            return
+        with contextlib.suppress(OSError):
+            _atomic_write_text(path, json.dumps(imports))
+
+
+def _dependency_order(files: list[PackedFile], cache_dir: Path | None = None) -> None:
     """Order files so widely-depended-on Python modules come first (an
     approximation of import-topological order; non-Python falls back to
     importance). Imports are resolved as full module names with relative imports
-    resolved against each file's package."""
+    resolved against each file's package, and cached by content hash."""
     mod_to_rel = {_module_name(f.rel_posix): f.rel_posix for f in files if f.language == "python"}
     popularity = {f.rel_posix: 0 for f in files}
+    imports_cache = _ImportsCache(cache_dir)
     for f in files:
         if f.language != "python":
             continue
-        try:
-            content = f.abs_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        pkg = _module_name(str(f.rel_posix).rsplit("/", 1)[0]) if "/" in f.rel_posix else ""
-        imps = _python_imports(content, pkg)
+        cached = imports_cache.load(f.git_blob)
+        if cached is not None:
+            imps = set(cached)
+        else:
+            try:
+                content = f.abs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            pkg = _module_name(str(f.rel_posix).rsplit("/", 1)[0]) if "/" in f.rel_posix else ""
+            imps = _python_imports(content, pkg)
+            imports_cache.save(f.git_blob, sorted(imps))
         for mod, target_rel in mod_to_rel.items():
             if target_rel == f.rel_posix:
                 continue
@@ -513,7 +561,7 @@ def pack_repo_to_one_pdf(
         snapshot_path=snapshot_path,
     )
     if order == "dependency":
-        _dependency_order(files)
+        _dependency_order(files, cache_dir)
     elif order == "importance":
         files.sort(key=_importance_key)
     else:
