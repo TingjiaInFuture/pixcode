@@ -312,6 +312,13 @@ Examples:
             help="Max columns per line for wrapping (default: 120) / 自动换行列数",
         )
         p.add_argument(
+            "--tab-size",
+            type=int,
+            default=2,
+            metavar="N",
+            help="Tab stop width for expansion (default: 2) / Tab 展开宽度",
+        )
+        p.add_argument(
             "--no-wrap",
             action="store_true",
             help="Disable line wrapping / 禁用自动换行",
@@ -500,6 +507,7 @@ def _run_onepdf(args: argparse.Namespace) -> int:
         include_patterns=args.include,
         max_cols=args.cols,
         wrap=not args.no_wrap,
+        tab_size=args.tab_size,
         include_tree=not args.no_tree,
         include_index=not args.no_index,
     )

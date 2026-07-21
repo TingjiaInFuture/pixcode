@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from reportlab.lib.pagesizes import A4
@@ -20,11 +21,11 @@ def pdf_escape_literal(s: str) -> str:
 
 
 class StreamingPDFWriter:
-    """
-    Stream-oriented PDF writer for ONEPDF_CORE.
+    """Stream-oriented PDF writer for ONEPDF_CORE.
 
-    Writes each page immediately without retaining the whole document in memory.
-    Uses reportlab's canvas so CJK text can be rendered via a registered system font.
+    Writes each page immediately without retaining the whole document in
+    memory, and writes to a temp file that is fsync'd + atomically replaced on
+    finalize so a mid-run crash never corrupts the previous good output.
     """
 
     def __init__(self, title: str, out_path: Path, fonts: FontRegistry | None = None):
@@ -32,7 +33,8 @@ class StreamingPDFWriter:
         self.out_path = out_path
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         self._fonts = fonts or register_fonts()
-        self._canvas = canvas.Canvas(str(out_path), pagesize=A4, pageCompression=1)
+        self._tmp_path = out_path.with_name(out_path.name + ".tmp")
+        self._canvas = canvas.Canvas(str(self._tmp_path), pagesize=A4, pageCompression=1)
         self._canvas.setTitle(title)
         _, self._page_height = A4
         self.page_count = 0
@@ -58,3 +60,11 @@ class StreamingPDFWriter:
 
     def finalize(self) -> None:
         self._canvas.save()
+        # fsync the temp file then atomically replace the destination, so the
+        # output is either fully old or fully new — never half-written.
+        try:
+            with open(self._tmp_path, "rb") as f:
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+        os.replace(self._tmp_path, self.out_path)

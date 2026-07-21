@@ -6,15 +6,13 @@ from pathlib import Path
 
 from .file_utils import (
     build_tree,
+    char_display_width,
     compile_ignore_matcher,
+    display_width,
     normalize_posix_path,
 )
 from .onepdf_writer import StreamingPDFWriter
 from .scanner import RepoScanner
-
-# Pre-built translate table shared by all _ascii_safe calls.
-_ASCII_SAFE_TABLE = str.maketrans({"\t": "    ", "\r": ""})
-
 
 DEFAULT_CORE_IGNORE_PATTERNS = [
     # Docs / meta
@@ -132,14 +130,32 @@ def collect_core_files(
     return packed, stats
 
 
-def _ascii_safe(s: str) -> str:
-    return s.translate(_ASCII_SAFE_TABLE)
+def _ascii_safe(s: str, tab_size: int) -> str:
+    # Drop CR and expand tabs to the next tab stop (replaces the old fixed
+    # "\t" → single-space substitution).
+    return s.replace("\r", "").expandtabs(tab_size)
 
 
 def _wrap_line(line: str, max_cols: int) -> list[str]:
-    if max_cols <= 0 or len(line) <= max_cols:
+    """Wrap by display width (East Asian Width), not character count, so CJK
+    and wide glyphs do not overrun the page."""
+    if max_cols <= 0 or display_width(line) <= max_cols:
         return [line]
-    return [line[i : i + max_cols] for i in range(0, len(line), max_cols)]
+    result: list[str] = []
+    cur: list[str] = []
+    cur_w = 0
+    for ch in line:
+        w = char_display_width(ch)
+        if cur and cur_w + w > max_cols:
+            result.append("".join(cur))
+            cur = [ch]
+            cur_w = w
+        else:
+            cur.append(ch)
+            cur_w += w
+    if cur:
+        result.append("".join(cur))
+    return result
 
 
 def pack_repo_to_one_pdf(
@@ -152,6 +168,7 @@ def pack_repo_to_one_pdf(
     include_patterns: list[str] | None = None,
     max_cols: int = 120,
     wrap: bool = True,
+    tab_size: int = 2,
     include_tree: bool = True,
     include_index: bool = True,
 ) -> dict[str, int]:
@@ -226,7 +243,7 @@ def pack_repo_to_one_pdf(
             continue
         with src:
             for raw_line in src:
-                safe_line = _ascii_safe(raw_line.rstrip())
+                safe_line = _ascii_safe(raw_line.rstrip(), tab_size)
                 if wrap:
                     for chunk in _wrap_line(safe_line, max_cols):
                         emit(chunk)

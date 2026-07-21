@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 from .constants import DEFAULT_IGNORE_DIRS
@@ -75,6 +76,21 @@ def should_ignore_dir(dirname: str) -> bool:
 
 def is_probably_text(blob: bytes, sample: int = 8192) -> bool:
     return b"\x00" not in blob[:sample]
+
+
+def char_display_width(ch: str) -> int:
+    """East Asian Width for monospace column accounting: W/F → 2,
+    control/combining → 0, others → 1."""
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    cat = unicodedata.category(ch)
+    if cat.startswith("C") or cat.startswith("M"):
+        return 0
+    return 1
+
+
+def display_width(text: str) -> int:
+    return sum(char_display_width(c) for c in text)
 
 
 def line_count_from_bytes(blob: bytes) -> int:
