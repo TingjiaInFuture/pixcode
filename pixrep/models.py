@@ -32,6 +32,8 @@ class FileInfo:
     line_count: int = 0
     content: str = field(default="", repr=False)
     index: int = 0
+    # Content fingerprint: git stage OID (git repos) or sha1(content) fallback.
+    git_blob: str | None = None
     semantic_map: SemanticMap = field(default_factory=SemanticMap)
     lint_issues: list[LintIssue] = field(default_factory=list)
     # Internal cache for lazy-loaded content; None means "not yet read".
@@ -71,3 +73,8 @@ class RepoInfo:
     language_stats: dict = field(default_factory=dict)
     tree_str: str = ""
     scan_stats: dict[str, int] = field(default_factory=dict)
+    # RepoSnapshot fields: how files were enumerated, the git-tracked set, and a
+    # fingerprint of the rendering/cache options (populated by callers).
+    source_mode: str = "walk"
+    tracked_paths: set[str] = field(default_factory=set)
+    options_hash: str = ""

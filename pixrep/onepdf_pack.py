@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -52,23 +51,6 @@ class PackedFile:
     line_count: int
 
 
-def _git_ls_files(repo_root: Path) -> list[str] | None:
-    try:
-        proc = subprocess.run(
-            ["git", "ls-files"],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-
-
 def collect_core_files(
     repo_root: Path,
     max_file_size: int,
@@ -101,14 +83,11 @@ def collect_core_files(
     )
     repo = scanner.scan(include_content=False)
 
-    # Optionally restrict to git-tracked files to mirror the old prefer_git
-    # behaviour (skip vendor/build outputs present in the worktree but not
-    # tracked by git).
-    git_set: set[str] | None = None
-    if prefer_git:
-        git_paths = _git_ls_files(repo_root)
-        if git_paths:
-            git_set = {normalize_posix_path(p) for p in git_paths}
+    # Restrict to git-tracked files when the scanner enumerated via git
+    # (prefer_git asked for it). The tracked set is already populated on
+    # RepoInfo by RepoScanner, so reuse it instead of spawning a second
+    # `git ls-files` subprocess (P1-4).
+    git_set: set[str] | None = repo.tracked_paths if repo.source_mode == "git" else None
 
     # Build include/exclude matchers for the secondary filters.
     include_match = compile_ignore_matcher(include_patterns) if include_patterns else None
