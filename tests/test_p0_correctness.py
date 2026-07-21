@@ -40,6 +40,15 @@ class TestP0Correctness(unittest.TestCase):
             self.assertTrue(name.startswith("a.py__"))
             self.assertTrue(name.endswith(".pdf"))
 
+    def test_output_name_path_hash_avoids_collision(self):
+        # P1: a/b_c.py and a_b/c.py must not share an output name.
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            info1 = FileInfo(path=Path("a/b_c.py"), abs_path=d / "x", language="python", size=1)
+            info2 = FileInfo(path=Path("a_b/c.py"), abs_path=d / "y", language="python", size=1)
+            gen = self._make_gen(d, [info1, info2])
+            self.assertNotEqual(gen._file_out_name(info1), gen._file_out_name(info2))
+
     def test_needs_regeneration_on_working_tree_change(self):
         # P0-1: a change in the working-tree content hash (not the git index
         # OID) must trigger regeneration.
