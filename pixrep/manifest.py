@@ -13,6 +13,7 @@ A `BuildManifest` is one JSON file under the cache root: `manifest.json`.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -55,7 +56,7 @@ def _config_signature(paths: list[Path]) -> str:
         found = True
         try:
             st = p.stat()
-            h.update(f"{p}|{int(st.st_mtime_ns)}|{st.st_size}\n".encode("utf-8"))
+            h.update(f"{p}|{int(st.st_mtime_ns)}|{st.st_size}\n".encode())
         except OSError:
             continue
     return h.hexdigest()[:12] if found else ""
@@ -84,35 +85,41 @@ def compute_options_hash(
     ruff_config_sig = ""
     eslint_config_sig = ""
     if repo_root is not None:
-        ruff_config_sig = _config_signature([
-            repo_root / "pyproject.toml",
-            repo_root / "ruff.toml",
-            repo_root / ".ruff.toml",
-        ])
-        eslint_config_sig = _config_signature([
-            repo_root / ".eslintrc.json",
-            repo_root / ".eslintrc.js",
-            repo_root / ".eslintrc.yml",
-            repo_root / ".eslintrc",
-            repo_root / "eslint.config.js",
-            repo_root / "eslint.config.mjs",
-            repo_root / "eslint.config.cjs",
-        ])
+        ruff_config_sig = _config_signature(
+            [
+                repo_root / "pyproject.toml",
+                repo_root / "ruff.toml",
+                repo_root / ".ruff.toml",
+            ]
+        )
+        eslint_config_sig = _config_signature(
+            [
+                repo_root / ".eslintrc.json",
+                repo_root / ".eslintrc.js",
+                repo_root / ".eslintrc.yml",
+                repo_root / ".eslintrc",
+                repo_root / "eslint.config.js",
+                repo_root / "eslint.config.mjs",
+                repo_root / "eslint.config.cjs",
+            ]
+        )
 
-    payload = "|".join([
-        f"pixrep={pixrep_version}",
-        f"theme={theme_id}",
-        f"font={font_id}",
-        f"dpi={png_dpi}",
-        f"fmt={output_format}",
-        f"sem={int(enable_semantic)}",
-        f"lint={int(enable_lint)}",
-        f"syntax={syntax_mode}",
-        f"ruff={ruff_version}",
-        f"eslint={eslint_version}",
-        f"ruffcfg={ruff_config_sig}",
-        f"eslintcfg={eslint_config_sig}",
-    ])
+    payload = "|".join(
+        [
+            f"pixrep={pixrep_version}",
+            f"theme={theme_id}",
+            f"font={font_id}",
+            f"dpi={png_dpi}",
+            f"fmt={output_format}",
+            f"sem={int(enable_semantic)}",
+            f"lint={int(enable_lint)}",
+            f"syntax={syntax_mode}",
+            f"ruff={ruff_version}",
+            f"eslint={eslint_version}",
+            f"ruffcfg={ruff_config_sig}",
+            f"eslintcfg={eslint_config_sig}",
+        ]
+    )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
@@ -187,7 +194,5 @@ class BuildManifest:
             os.replace(tmp, self.path)
         except OSError:
             if tmp is not None:
-                try:
+                with contextlib.suppress(OSError):
                     tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass

@@ -17,4 +17,3 @@ __all__ = [
     "collect_core_files",
     "pack_repo_to_one_pdf",
 ]
-

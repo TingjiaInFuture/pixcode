@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +61,7 @@ class QueryResultRenderer:
             return
 
         import tempfile
+
         from .utils import pdf_to_long_png
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -76,10 +78,8 @@ class QueryResultRenderer:
             doc.build(story, onFirstPage=self._footer, onLaterPages=self._footer)
             images = pdf_to_long_png(tmp_path, dpi=self.png_dpi)
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
         if len(images) == 1:
             self.output_path.write_bytes(next(iter(images.values())))
@@ -125,32 +125,34 @@ class QueryResultRenderer:
 
         box_width = (content_width - 15) / 3
         stats_table = Table(
-            [[
-                StatBox(
-                    "MATCHES",
-                    str(sum(len(s.match_lines) for s in self.snippets)),
-                    COLORS["accent"],
-                    fonts=self.fonts,
-                    width=box_width,
-                    height=45,
-                ),
-                StatBox(
-                    "FILES",
-                    str(unique_files),
-                    COLORS["accent2"],
-                    fonts=self.fonts,
-                    width=box_width,
-                    height=45,
-                ),
-                StatBox(
-                    "SNIPPETS",
-                    str(len(self.snippets)),
-                    COLORS["green"],
-                    fonts=self.fonts,
-                    width=box_width,
-                    height=45,
-                ),
-            ]],
+            [
+                [
+                    StatBox(
+                        "MATCHES",
+                        str(sum(len(s.match_lines) for s in self.snippets)),
+                        COLORS["accent"],
+                        fonts=self.fonts,
+                        width=box_width,
+                        height=45,
+                    ),
+                    StatBox(
+                        "FILES",
+                        str(unique_files),
+                        COLORS["accent2"],
+                        fonts=self.fonts,
+                        width=box_width,
+                        height=45,
+                    ),
+                    StatBox(
+                        "SNIPPETS",
+                        str(len(self.snippets)),
+                        COLORS["green"],
+                        fonts=self.fonts,
+                        width=box_width,
+                        height=45,
+                    ),
+                ]
+            ],
             colWidths=[box_width + 5] * 3,
         )
         stats_table.setStyle(

@@ -1,3 +1,4 @@
+import contextlib
 import shutil
 import unittest
 import uuid
@@ -26,10 +27,8 @@ class TestStreamingPDFWriter(unittest.TestCase):
             self.assertIn(b"startxref\n", blob)
             self.assertTrue(blob.rstrip().endswith(b"%%EOF"))
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 out_pdf.unlink(missing_ok=True)
-            except Exception:
-                pass
             if tmp_root.exists() and not any(tmp_root.iterdir()):
                 shutil.rmtree(tmp_root, ignore_errors=True)
 

@@ -4,13 +4,12 @@ import re
 import sys
 from pathlib import Path
 
-from .pdf_generator import PDFGenerator
-from .scanner import RepoScanner
-from .onepdf import pack_repo_to_one_pdf
 from .file_utils import normalize_posix_path
 from .models import RepoInfo
+from .onepdf import pack_repo_to_one_pdf
+from .pdf_generator import PDFGenerator
+from .scanner import RepoScanner
 from .version import __version__
-
 
 log = logging.getLogger(__name__)
 
@@ -63,9 +62,7 @@ Examples:
   pixrep help generate
         """,
     )
-    parser.add_argument(
-        "-V", "--version", action="version", version=f"pixrep {__version__}"
-    )
+    parser.add_argument("-V", "--version", action="version", version=f"pixrep {__version__}")
 
     common = _build_common_parser()
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -77,7 +74,9 @@ Examples:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     generate_parser.add_argument(
-        "-o", "--output", default=None,
+        "-o",
+        "--output",
+        default=None,
         help="Output directory (default: ./pixrep_output/<repo>) / 输出目录",
     )
     generate_parser.add_argument(
@@ -111,7 +110,8 @@ Examples:
         help="Split oversized PNGs into multiple images / 超像素时输出多张分页 PNG",
     )
     generate_parser.add_argument(
-        "--index-only", action="store_true",
+        "--index-only",
+        action="store_true",
         help="Generate only 00_INDEX.pdf / 仅生成索引 PDF",
     )
     generate_parser.add_argument(
@@ -155,7 +155,8 @@ Examples:
         help="Shortcut for --syntax none (faster, smaller PDFs) / 等价 --syntax none",
     )
     generate_parser.add_argument(
-        "--list-only", action="store_true",
+        "--list-only",
+        action="store_true",
         help=argparse.SUPPRESS,
     )
 
@@ -379,7 +380,9 @@ def _configure_logging(level: str) -> None:
     logging.getLogger("reportlab").setLevel(logging.WARNING)
 
 
-def _scan_repo(args: argparse.Namespace, include_content: bool = True) -> tuple[RepoInfo | None, int]:
+def _scan_repo(
+    args: argparse.Namespace, include_content: bool = True
+) -> tuple[RepoInfo | None, int]:
     repo_path = Path(args.repo).resolve()
     if not repo_path.is_dir():
         log.error("Error: '%s' is not a directory", args.repo)

@@ -11,7 +11,6 @@ from .syntax import BUILTIN_FUNCTIONS, COMMENT_STYLES, KEYWORDS
 from .theme import COLORS
 from .utils import str_width, truncate_to_width
 
-
 _SPLIT_WS = re.compile(r"(\s+)")
 _BACKTICK_RE = re.compile(r"(?<!\\)`")
 
@@ -70,13 +69,18 @@ class CodeBlockChunk(Flowable):
     所有文字用注册的 mono 字体绘制。
     """
 
-    def __init__(self, lines: list[str], language: str,
-                 fonts: FontRegistry,
-                 start_line: int = 1, width: float | None = None,
-                 font_size: float = 6.5,
-                 line_heat: dict[int, str] | None = None,
-                 syntax: str = "full",
-                 _precomputed_mask: list[bool] | None = None):
+    def __init__(
+        self,
+        lines: list[str],
+        language: str,
+        fonts: FontRegistry,
+        start_line: int = 1,
+        width: float | None = None,
+        font_size: float = 6.5,
+        line_heat: dict[int, str] | None = None,
+        syntax: str = "full",
+        _precomputed_mask: list[bool] | None = None,
+    ):
         super().__init__()
         self.code_lines = lines
         self.language = language
@@ -95,7 +99,11 @@ class CodeBlockChunk(Flowable):
         self.kw_set = KEYWORDS.get(language, set())
         self.builtin_set = BUILTIN_FUNCTIONS.get(language, set())
         self.line_comment = COMMENT_STYLES.get(language)
-        self._ml_string_mask = _precomputed_mask if _precomputed_mask is not None else self._compute_multiline_string_mask()
+        self._ml_string_mask = (
+            _precomputed_mask
+            if _precomputed_mask is not None
+            else self._compute_multiline_string_mask()
+        )
 
     def _compute_multiline_string_mask(self) -> list[bool]:
         """
@@ -232,7 +240,9 @@ class CodeBlockChunk(Flowable):
             canv.drawRightString(line_no_width - 6, text_y, str(line_no))
 
             display = truncate_to_width(line, self.font_size, code_area_width)
-            self._draw_line(canv, code_x, text_y, display, in_multiline_string=self._ml_string_mask[i])
+            self._draw_line(
+                canv, code_x, text_y, display, in_multiline_string=self._ml_string_mask[i]
+            )
 
     def _draw_line(self, canv, x, y, line, in_multiline_string: bool = False):
         fs = self.font_size
@@ -361,12 +371,11 @@ class CodeBlockChunk(Flowable):
         while i < len(line):
             ch = line[i]
 
-            if kind == "code" and comment and quote is None:
+            if kind == "code" and comment and quote is None and line.startswith(comment, i):
                 # Start of line comment (outside any string).
-                if line.startswith(comment, i):
-                    flush()
-                    out.append((line[i:], "comment"))
-                    return out
+                flush()
+                out.append((line[i:], "comment"))
+                return out
 
             if kind == "code":
                 if ch in ('"', "'", "`"):
@@ -481,9 +490,7 @@ class SemanticMiniMap(Flowable):
 
         if self._show_summary_line:
             canv.setFillColor(COLORS["comment"])
-            summary = (
-                f"... ({self.semantic_map.node_count} nodes, {self.semantic_map.edge_count} edges total)"
-            )
+            summary = f"... ({self.semantic_map.node_count} nodes, {self.semantic_map.edge_count} edges total)"
             canv.drawString(8, y, truncate_to_width(summary, 7, self.map_width - 16))
 
 
@@ -517,9 +524,13 @@ class LintLegend(Flowable):
 
 
 class HeaderBar(Flowable):
-    def __init__(self, text: str, subtext: str = "",
-                 fonts: FontRegistry | None = None,
-                 width: float | None = None):
+    def __init__(
+        self,
+        text: str,
+        subtext: str = "",
+        fonts: FontRegistry | None = None,
+        width: float | None = None,
+    ):
         super().__init__()
         self.text = text
         self.subtext = subtext
@@ -545,9 +556,15 @@ class HeaderBar(Flowable):
 
 
 class StatBox(Flowable):
-    def __init__(self, label: str, value: str, color: Color,
-                 fonts: FontRegistry | None = None,
-                 width: float = 80, height: float = 50):
+    def __init__(
+        self,
+        label: str,
+        value: str,
+        color: Color,
+        fonts: FontRegistry | None = None,
+        width: float = 80,
+        height: float = 50,
+    ):
         super().__init__()
         self.label = label
         self.value = value
@@ -565,8 +582,7 @@ class StatBox(Flowable):
         canv.roundRect(0, 0, self.box_width, self.box_height, 6, fill=1, stroke=0)
         canv.setFillColor(white)
         canv.setFont(self.fonts.bold if self.fonts else "Helvetica-Bold", 16)
-        canv.drawCentredString(self.box_width / 2, self.box_height - 25,
-                               str(self.value))
+        canv.drawCentredString(self.box_width / 2, self.box_height - 25, str(self.value))
         canv.setFont(self.fonts.normal if self.fonts else "Helvetica", 8)
         canv.setFillColor(HexColor("#ffffffcc"))
         canv.drawCentredString(self.box_width / 2, 8, self.label)

@@ -1,8 +1,8 @@
+import concurrent.futures
 import hashlib
 import logging
 import os
 import subprocess
-import concurrent.futures
 from pathlib import Path
 
 from .constants import DEFAULT_IGNORE_PATTERNS
@@ -21,10 +21,14 @@ log = logging.getLogger(__name__)
 
 
 class RepoScanner:
-    def __init__(self, root: str, max_file_size: int = 512 * 1024,
-                 extra_ignore: list[str] | None = None,
-                 prefer_git_source: bool = True,
-                 scan_workers: int | None = None):
+    def __init__(
+        self,
+        root: str,
+        max_file_size: int = 512 * 1024,
+        extra_ignore: list[str] | None = None,
+        prefer_git_source: bool = True,
+        scan_workers: int | None = None,
+    ):
         self.root = Path(root).resolve()
         self.max_file_size = max_file_size
         self.extra_ignore = extra_ignore or []
@@ -43,7 +47,7 @@ class RepoScanner:
     def _read_bytes(self, filepath: Path) -> bytes | None:
         try:
             return filepath.read_bytes()
-        except (IOError, OSError) as e:
+        except OSError as e:
             log.debug("failed to read file: %s (%s)", filepath, e)
             return None
 
@@ -68,7 +72,7 @@ class RepoScanner:
             if not ends_with_newline:
                 total += 1
             return total
-        except (IOError, OSError) as e:
+        except OSError as e:
             log.debug("failed to stream-count lines: %s (%s)", filepath, e)
             return None
 
@@ -254,8 +258,9 @@ class RepoScanner:
             lang_stats.setdefault(info.language, {"files": 0, "lines": 0})
             lang_stats[info.language]["files"] += 1
             lang_stats[info.language]["lines"] += info.line_count
-        repo.language_stats = dict(sorted(
-            lang_stats.items(), key=lambda item: item[1]["lines"], reverse=True))
+        repo.language_stats = dict(
+            sorted(lang_stats.items(), key=lambda item: item[1]["lines"], reverse=True)
+        )
         repo.tree_str = self._build_tree(files)
         repo.scan_stats = scan_stats
         return repo

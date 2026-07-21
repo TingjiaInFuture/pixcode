@@ -1,14 +1,14 @@
 from functools import lru_cache
-from pathlib import Path
 
 
 def xml_escape(text: str) -> str:
-    return (text
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&#39;"))
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
 
 
 @lru_cache(maxsize=8192)
@@ -18,12 +18,14 @@ def char_width(char: str, font_size: float) -> float:
     CJK字符约为 font_size 宽，ASCII约为 font_size * 0.6。
     """
     cp = ord(char)
-    if (0x2E80 <= cp <= 0x9FFF) or \
-       (0xF900 <= cp <= 0xFAFF) or \
-       (0xFE30 <= cp <= 0xFE4F) or \
-       (0xFF00 <= cp <= 0xFFEF) or \
-       (0x20000 <= cp <= 0x2FA1F) or \
-       (0x3000 <= cp <= 0x303F):
+    if (
+        (0x2E80 <= cp <= 0x9FFF)
+        or (0xF900 <= cp <= 0xFAFF)
+        or (0xFE30 <= cp <= 0xFE4F)
+        or (0xFF00 <= cp <= 0xFFEF)
+        or (0x20000 <= cp <= 0x2FA1F)
+        or (0x3000 <= cp <= 0x303F)
+    ):
         return font_size * 1.0
     return font_size * 0.6
 
@@ -53,7 +55,7 @@ def truncate_to_width(text: str, font_size: float, max_width: float) -> str:
         max_chars = int(max_width / (font_size * 0.6))
         if len(text) <= max_chars:
             return text
-        return text[:max(0, max_chars)] + "…"
+        return text[: max(0, max_chars)] + "…"
 
     w = 0.0
     for i, c in enumerate(text):
@@ -130,7 +132,6 @@ def pdf_to_long_png(
     split : bool
         超像素预算时是否输出多张分页 PNG（默认 False，仅缩小）。
     """
-    import io
 
     import fitz
     from PIL import Image
@@ -155,8 +156,7 @@ def pdf_to_long_png(
 
         matrix = fitz.Matrix(scale, scale)
         page_wh = [
-            (max(1, int(r.width * scale)), max(1, int(r.height * scale)))
-            for r in page_rects
+            (max(1, int(r.width * scale)), max(1, int(r.height * scale))) for r in page_rects
         ]
 
         groups = _group_pages(page_wh, max_total_pixels, split)
@@ -166,7 +166,7 @@ def pdf_to_long_png(
             group_height = sum(h for _, h in gwh)
             canvas = Image.new("RGB", (group_width, group_height), color="white")
             y = 0
-            for idx, (_w, h) in zip(indices, gwh):
+            for idx, (_w, h) in zip(indices, gwh, strict=False):
                 pix = doc[idx].get_pixmap(matrix=matrix)
                 page_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                 canvas.paste(page_img, (0, y))

@@ -1,18 +1,19 @@
+import contextlib
 import hashlib
 import logging
 import os
+import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 from pathlib import Path
-import re
 
+from reportlab.lib.colors import HexColor
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.lib.colors import HexColor, white
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+    SimpleDocTemplate,
+    Spacer,
 )
 
 from .analysis import CodeInsightEngine
@@ -23,27 +24,30 @@ from .manifest import BuildManifest, FileEntry, compute_options_hash
 from .models import FileInfo, RepoInfo
 from .pdf_story_builders import build_file_preamble, build_file_story, build_index_story
 from .theme import COLORS
-from .utils import pdf_to_long_png, xml_escape
+from .utils import pdf_to_long_png
 from .version import __version__
-
 
 log = logging.getLogger(__name__)
 
 
 class PDFGenerator:
-    def __init__(self, repo: RepoInfo, output_dir: str,
-                 fonts: FontRegistry | None = None,
-                 enable_semantic_minimap: bool = True,
-                 enable_lint_heatmap: bool = True,
-                 linter_timeout: int = 20,
-                 incremental: bool = False,
-                 max_workers: int | None = None,
-                 output_format: str = "pdf",
-                 png_dpi: int = 150,
-                 max_total_pixels: int = 120_000_000,
-                 png_optimize: bool = False,
-                 png_split: bool = False,
-                 syntax_mode: str = "full"):
+    def __init__(
+        self,
+        repo: RepoInfo,
+        output_dir: str,
+        fonts: FontRegistry | None = None,
+        enable_semantic_minimap: bool = True,
+        enable_lint_heatmap: bool = True,
+        linter_timeout: int = 20,
+        incremental: bool = False,
+        max_workers: int | None = None,
+        output_format: str = "pdf",
+        png_dpi: int = 150,
+        max_total_pixels: int = 120_000_000,
+        png_optimize: bool = False,
+        png_split: bool = False,
+        syntax_mode: str = "full",
+    ):
         self.repo = repo
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -119,10 +123,7 @@ class PDFGenerator:
         log.info("")
 
         manifest = BuildManifest.load(self.insight_engine.manifest_path)
-        pending = [
-            info for info in self.repo.files
-            if self._needs_regeneration(info, manifest)
-        ]
+        pending = [info for info in self.repo.files if self._needs_regeneration(info, manifest)]
         skipped = len(self.repo.files) - len(pending)
         if skipped:
             log.info("  Skipping %d up-to-date file %ss", skipped, fmt_label)
@@ -176,9 +177,7 @@ class PDFGenerator:
             return True
         if manifest.options_hash != self.repo.options_hash:
             return True
-        if manifest.pixrep_version != __version__:
-            return True
-        return False
+        return manifest.pixrep_version != __version__
 
     def _save_manifest(self, manifest: BuildManifest) -> None:
         """Persist current file fingerprints + options hash for the next run."""
@@ -210,10 +209,8 @@ class PDFGenerator:
         canvas.saveState()
         canvas.setFont(self.fonts.normal, 7)
         canvas.setFillColor(HexColor("#999999"))
-        canvas.drawString(self.margin, 10 * mm,
-                          f"pixrep · {self.repo.name}")
-        canvas.drawRightString(self.page_width - self.margin, 10 * mm,
-                               f"Page {doc.page}")
+        canvas.drawString(self.margin, 10 * mm, f"pixrep · {self.repo.name}")
+        canvas.drawRightString(self.page_width - self.margin, 10 * mm, f"Page {doc.page}")
         canvas.restoreState()
 
     def _make_doc(self, target):
@@ -224,14 +221,14 @@ class PDFGenerator:
         target : str | Path | io.BytesIO
             输出目标——文件路径或内存缓冲区。
         """
-        if isinstance(target, (str, Path)):
-            dest = str(target)
-        else:
-            dest = target
+        dest = str(target) if isinstance(target, (str, Path)) else target
         return SimpleDocTemplate(
-            dest, pagesize=A4,
-            leftMargin=self.margin, rightMargin=self.margin,
-            topMargin=self.margin, bottomMargin=15 * mm,
+            dest,
+            pagesize=A4,
+            leftMargin=self.margin,
+            rightMargin=self.margin,
+            topMargin=self.margin,
+            bottomMargin=15 * mm,
         )
 
     def _build_and_save(self, story: list, out_path: Path) -> None:
@@ -242,18 +239,14 @@ class PDFGenerator:
         """
         if self.output_format == "pdf":
             doc = self._make_doc(out_path)
-            doc.build(story,
-                      onFirstPage=self._page_footer,
-                      onLaterPages=self._page_footer)
+            doc.build(story, onFirstPage=self._page_footer, onLaterPages=self._page_footer)
             return
 
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
             doc = self._make_doc(tmp_path)
-            doc.build(story,
-                      onFirstPage=self._page_footer,
-                      onLaterPages=self._page_footer)
+            doc.build(story, onFirstPage=self._page_footer, onLaterPages=self._page_footer)
             images = pdf_to_long_png(
                 tmp_path,
                 dpi=self.png_dpi,
@@ -262,10 +255,8 @@ class PDFGenerator:
                 split=self.png_split,
             )
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
         if len(images) == 1:
             out_path.write_bytes(next(iter(images.values())))
@@ -314,24 +305,36 @@ class PDFGenerator:
     def _build_file_story(self, file_info: FileInfo) -> list:
         return build_file_story(self, file_info)
 
-    def _add_code_chunks(self, story, all_lines, language, width,
-                         first_avail, later_avail, font_size=6.5,
-                         line_heat: dict[int, str] | None = None):
+    def _add_code_chunks(
+        self,
+        story,
+        all_lines,
+        language,
+        width,
+        first_avail,
+        later_avail,
+        font_size=6.5,
+        line_heat: dict[int, str] | None = None,
+    ):
         offset = 0
         first_chunk = True
         while offset < len(all_lines):
             avail = first_avail if first_chunk else later_avail
             n = self._max_lines_for_height(avail, font_size)
-            chunk = all_lines[offset:offset + n]
+            chunk = all_lines[offset : offset + n]
 
-            story.append(CodeBlockChunk(
-                chunk, language,
-                fonts=self.fonts,
-                start_line=offset + 1,
-                width=width, font_size=font_size,
-                line_heat=line_heat,
-                syntax=self.syntax_mode,
-            ))
+            story.append(
+                CodeBlockChunk(
+                    chunk,
+                    language,
+                    fonts=self.fonts,
+                    start_line=offset + 1,
+                    width=width,
+                    font_size=font_size,
+                    line_heat=line_heat,
+                    syntax=self.syntax_mode,
+                )
+            )
 
             offset += n
             first_chunk = False
@@ -341,9 +344,17 @@ class PDFGenerator:
                 else:
                     story.append(Spacer(1, 1))
 
-    def _add_code_chunks_streaming(self, story, abs_path: Path, language, width,
-                                   first_avail, later_avail, font_size=6.5,
-                                   line_heat: dict[int, str] | None = None):
+    def _add_code_chunks_streaming(
+        self,
+        story,
+        abs_path: Path,
+        language,
+        width,
+        first_avail,
+        later_avail,
+        font_size=6.5,
+        line_heat: dict[int, str] | None = None,
+    ):
         first_chunk = True
         line_no = 1
 
@@ -362,14 +373,18 @@ class PDFGenerator:
                     if not chunk:
                         break
 
-                    story.append(CodeBlockChunk(
-                        chunk, language,
-                        fonts=self.fonts,
-                        start_line=line_no,
-                        width=width, font_size=font_size,
-                        line_heat=line_heat,
-                        syntax=self.syntax_mode,
-                    ))
+                    story.append(
+                        CodeBlockChunk(
+                            chunk,
+                            language,
+                            fonts=self.fonts,
+                            start_line=line_no,
+                            width=width,
+                            font_size=font_size,
+                            line_heat=line_heat,
+                            syntax=self.syntax_mode,
+                        )
+                    )
 
                     line_no += len(chunk)
                     first_chunk = False
@@ -380,25 +395,39 @@ class PDFGenerator:
                         else:
                             story.append(Spacer(1, 1))
         except OSError:
-            story.append(CodeBlockChunk(
-                ["(read failed)"], language,
-                fonts=self.fonts,
-                start_line=1,
-                width=width, font_size=font_size,
-                line_heat=line_heat,
-                syntax=self.syntax_mode,
-            ))
+            story.append(
+                CodeBlockChunk(
+                    ["(read failed)"],
+                    language,
+                    fonts=self.fonts,
+                    start_line=1,
+                    width=width,
+                    font_size=font_size,
+                    line_heat=line_heat,
+                    syntax=self.syntax_mode,
+                )
+            )
 
-    def iter_code_chunks(self, file_info: FileInfo, width: float,
-                         first_avail: float, later_avail: float,
-                         font_size: float = 6.5,
-                         line_heat: dict[int, str] | None = None):
+    def iter_code_chunks(
+        self,
+        file_info: FileInfo,
+        width: float,
+        first_avail: float,
+        later_avail: float,
+        font_size: float = 6.5,
+        line_heat: dict[int, str] | None = None,
+    ):
         """Yield (CodeBlockChunk, full_page) for a file without building a
         Platypus story (P1-5). Streams large files from disk."""
         if file_info.size >= self.streaming_file_threshold:
             yield from self._iter_streaming(
-                file_info.abs_path, file_info.language, width,
-                first_avail, later_avail, font_size, line_heat,
+                file_info.abs_path,
+                file_info.language,
+                width,
+                first_avail,
+                later_avail,
+                font_size,
+                line_heat,
             )
             return
         try:
@@ -411,13 +440,15 @@ class PDFGenerator:
         while offset < len(all_lines):
             avail = first_avail if first else later_avail
             n = self._max_lines_for_height(avail, font_size)
-            chunk_lines = all_lines[offset:offset + n]
+            chunk_lines = all_lines[offset : offset + n]
             yield (
                 CodeBlockChunk(
-                    chunk_lines, file_info.language,
+                    chunk_lines,
+                    file_info.language,
                     fonts=self.fonts,
                     start_line=offset + 1,
-                    width=width, font_size=font_size,
+                    width=width,
+                    font_size=font_size,
                     line_heat=line_heat,
                     syntax=self.syntax_mode,
                 ),
@@ -426,10 +457,16 @@ class PDFGenerator:
             offset += n
             first = False
 
-    def _iter_streaming(self, abs_path: Path, language: str, width: float,
-                        first_avail: float, later_avail: float,
-                        font_size: float = 6.5,
-                        line_heat: dict[int, str] | None = None):
+    def _iter_streaming(
+        self,
+        abs_path: Path,
+        language: str,
+        width: float,
+        first_avail: float,
+        later_avail: float,
+        font_size: float = 6.5,
+        line_heat: dict[int, str] | None = None,
+    ):
         first_chunk = True
         line_no = 1
         try:
@@ -447,10 +484,12 @@ class PDFGenerator:
                         break
                     yield (
                         CodeBlockChunk(
-                            chunk, language,
+                            chunk,
+                            language,
                             fonts=self.fonts,
                             start_line=line_no,
-                            width=width, font_size=font_size,
+                            width=width,
+                            font_size=font_size,
                             line_heat=line_heat,
                             syntax=self.syntax_mode,
                         ),
@@ -461,10 +500,12 @@ class PDFGenerator:
         except OSError:
             yield (
                 CodeBlockChunk(
-                    ["(read failed)"], language,
+                    ["(read failed)"],
+                    language,
                     fonts=self.fonts,
                     start_line=1,
-                    width=width, font_size=font_size,
+                    width=width,
+                    font_size=font_size,
                     line_heat=line_heat,
                     syntax=self.syntax_mode,
                 ),

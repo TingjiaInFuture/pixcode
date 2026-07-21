@@ -63,7 +63,9 @@ class TestQueryMode(unittest.TestCase):
                     )
                 ],
             )
-            extractor = ContextExtractor(repo=repo, context_lines=1, max_snippet_lines=20, merge_gap=2)
+            extractor = ContextExtractor(
+                repo=repo, context_lines=1, max_snippet_lines=20, merge_gap=2
+            )
             snippets = extractor.extract(
                 [
                     MatchLocation("a.py", 3, "    cache = {}"),
@@ -116,6 +118,37 @@ class TestQueryMode(unittest.TestCase):
             self.assertIn(5, lines)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_build_match_parses_match_event(self):
+        tmpdir = Path(tempfile.mkdtemp(prefix="pixrep_bm_"))
+        try:
+            file_path = tmpdir / "a.py"
+            file_path.write_text("x = 1\n", encoding="utf-8")
+            searcher = RipgrepSearcher(repo_root=tmpdir)
+            msg = {
+                "type": "match",
+                "data": {
+                    "path": {"text": str(file_path)},
+                    "line_number": 5,
+                    "lines": {"text": "x = 1\n"},
+                    "submatches": [{"start": 0, "end": 1}],
+                },
+            }
+            m = searcher._build_match(msg)
+            self.assertIsNotNone(m)
+            self.assertEqual(m.line_number, 5)
+            self.assertEqual(m.line_text, "x = 1")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_file_cache_key_is_blob_sensitive(self):
+        # P1-1: per-file cache key must be stable for the same (rel, blob) and
+        # change when the content fingerprint changes.
+        k1 = SemanticSearcher._file_cache_key("a.py", "blob1")
+        k2 = SemanticSearcher._file_cache_key("a.py", "blob1")
+        k3 = SemanticSearcher._file_cache_key("a.py", "blob2")
+        self.assertEqual(k1, k2)
+        self.assertNotEqual(k1, k3)
 
 
 if __name__ == "__main__":

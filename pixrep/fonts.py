@@ -1,10 +1,9 @@
-from dataclasses import dataclass
-import os
 import logging
+import os
+from dataclasses import dataclass
 
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-
 
 log = logging.getLogger(__name__)
 

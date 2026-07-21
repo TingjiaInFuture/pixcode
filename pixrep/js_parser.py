@@ -5,7 +5,6 @@ import re
 
 from .models import SemanticMap
 
-
 JS_CLASS_PAT = re.compile(
     r"^\s*class\s+([A-Za-z_]\w*)(?:\s+extends\s+([A-Za-z_]\w*))?",
     re.MULTILINE,
@@ -71,7 +70,9 @@ def _preprocess_non_code_spans(content: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _span_at(index: int, spans: list[tuple[int, int]], span_starts: list[int]) -> tuple[int, int] | None:
+def _span_at(
+    index: int, spans: list[tuple[int, int]], span_starts: list[int]
+) -> tuple[int, int] | None:
     pos = bisect.bisect_right(span_starts, index) - 1
     if pos < 0:
         return None

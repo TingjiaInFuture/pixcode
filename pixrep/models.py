@@ -52,9 +52,7 @@ class FileInfo:
         Falls back to `.content` for callers that pass content at construction.
         """
         if self._content_cache is None:
-            self._content_cache = self.abs_path.read_text(
-                encoding="utf-8", errors="replace"
-            )
+            self._content_cache = self.abs_path.read_text(encoding="utf-8", errors="replace")
         return self._content_cache
 
     def release_content(self) -> None:

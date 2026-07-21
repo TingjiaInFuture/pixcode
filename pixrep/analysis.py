@@ -1,5 +1,6 @@
 import ast
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import logging
@@ -41,12 +42,13 @@ class CodeInsightEngine:
         self._options_hash = repo.options_hash
         self._resolved_root = self.repo.root.resolve()
         self._scanned_paths = {self._normalize_path(info.path) for info in self.repo.files}
-        self._scanned_paths_ci = {k.lower(): k for k in self._scanned_paths} if os.name == "nt" else {}
+        self._scanned_paths_ci = (
+            {k.lower(): k for k in self._scanned_paths} if os.name == "nt" else {}
+        )
         # rel -> content fingerprint (git blob OID or sha1), used as the cache
         # identity for lint (and available for any per-file cache).
         self._blob_by_rel = {
-            self._normalize_path(info.path): info.git_blob
-            for info in self.repo.files
+            self._normalize_path(info.path): info.git_blob for info in self.repo.files
         }
         self._cache_root = self._resolve_cache_root()
         self._semantic_cache_dir = self._cache_root / "semantic"
@@ -86,8 +88,7 @@ class CodeInsightEngine:
             workers = min(4, max(1, os.cpu_count() or 1))
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 future_map = {
-                    pool.submit(self._build_semantic_map_cached, info): info
-                    for info in files
+                    pool.submit(self._build_semantic_map_cached, info): info for info in files
                 }
                 for fut in concurrent.futures.as_completed(future_map):
                     info = future_map[fut]
@@ -174,10 +175,8 @@ class CodeInsightEngine:
             out, _err = proc.communicate(timeout=max(0.1, timeout))
         except subprocess.TimeoutExpired:
             proc.kill()
-            try:
+            with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
             log.debug("%s timed out and was killed", tool)
             return None
 
@@ -208,9 +207,7 @@ class CodeInsightEngine:
             if remaining <= 0:
                 break
             cmd = ["ruff", "check", "--output-format", "json", *batch]
-            data = self._run_json_command(
-                cmd, cwd=self.repo.root, tool="ruff", timeout=remaining
-            )
+            data = self._run_json_command(cmd, cwd=self.repo.root, tool="ruff", timeout=remaining)
             if not data:
                 continue
             for item in data:
@@ -322,7 +319,7 @@ class CodeInsightEngine:
                 pass
 
         semantic_map = self._build_semantic_map(info)
-        try:
+        with contextlib.suppress(OSError):
             cache_path.write_text(
                 json.dumps(
                     {
@@ -336,8 +333,6 @@ class CodeInsightEngine:
                 ),
                 encoding="utf-8",
             )
-        except OSError:
-            pass
         return semantic_map
 
     def _python_semantic_map(self, content: str) -> SemanticMap:
@@ -353,8 +348,14 @@ class CodeInsightEngine:
     def _generic_semantic_map(self, content: str, language: str) -> SemanticMap:
         if language in {"text", "json", "yaml", "toml", "markdown", "ini"}:
             return SemanticMap(kind="none", lines=[])
-        sigs = re.findall(r"^\s*(?:def|fn|func|function)\s+([A-Za-z_]\w*)", content, flags=re.MULTILINE)
-        lines = ["Functions:"] + [f"  - {name}()" for name in sigs[:12]] if sigs else ["(no symbols detected)"]
+        sigs = re.findall(
+            r"^\s*(?:def|fn|func|function)\s+([A-Za-z_]\w*)", content, flags=re.MULTILINE
+        )
+        lines = (
+            ["Functions:"] + [f"  - {name}()" for name in sigs[:12]]
+            if sigs
+            else ["(no symbols detected)"]
+        )
         lines, truncated = self._limit_semantic_lines(lines)
         return SemanticMap(
             kind="callgraph",
@@ -404,13 +405,13 @@ class CodeInsightEngine:
 
     def _tool_cache_key(self, tool: str, targets: list[str]) -> str:
         h = hashlib.sha1()
-        h.update(f"{tool}|{self._options_hash}|v3|".encode("utf-8"))
+        h.update(f"{tool}|{self._options_hash}|v3|".encode())
         for rel in sorted(set(targets)):
             blob = self._blob_by_rel.get(rel)
             if blob:
-                h.update(f"{rel}|{blob}\n".encode("utf-8"))
+                h.update(f"{rel}|{blob}\n".encode())
             else:
-                h.update(f"{rel}|missing\n".encode("utf-8"))
+                h.update(f"{rel}|missing\n".encode())
         return h.hexdigest()
 
     def _load_lint_cache(self, tool: str, key: str) -> dict[str, list[LintIssue]] | None:
@@ -468,10 +469,8 @@ class CodeInsightEngine:
             os.replace(tmp_path, path)
         except OSError:
             if tmp_path is not None:
-                try:
+                with contextlib.suppress(OSError):
                     tmp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
             return
 
     @staticmethod

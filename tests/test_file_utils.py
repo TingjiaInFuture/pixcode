@@ -1,7 +1,7 @@
-import unittest
-from pathlib import Path
 import shutil
+import unittest
 import uuid
+from pathlib import Path
 
 from pixrep.file_utils import (
     build_tree,

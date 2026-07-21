@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .constants import DEFAULT_IGNORE_PATTERNS
 from .file_utils import (
     build_tree,
     compile_ignore_matcher,

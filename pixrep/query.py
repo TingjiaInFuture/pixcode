@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -16,8 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .constants import DEFAULT_IGNORE_PATTERNS
-from .file_utils import normalize_posix_path
-from .file_utils import compile_ignore_matcher, should_ignore_dir
+from .file_utils import compile_ignore_matcher, normalize_posix_path, should_ignore_dir
 from .models import FileInfo, RepoInfo
 
 log = logging.getLogger(__name__)
@@ -164,19 +164,15 @@ class RipgrepSearcher:
         finally:
             self._kill(proc)
             if proc.stdout is not None:
-                try:
+                with contextlib.suppress(OSError):
                     proc.stdout.close()
-                except OSError:
-                    pass
         return matches
 
     @staticmethod
     def _kill(proc: subprocess.Popen) -> None:
         if proc.poll() is None:
-            try:
+            with contextlib.suppress(OSError):
                 proc.kill()
-            except OSError:
-                pass
 
     def _build_match(self, msg: dict) -> MatchLocation | None:
         if msg.get("type") != "match":
@@ -305,7 +301,9 @@ class SemanticSearcher:
         case_sensitive: bool = False,
         file_globs: list[str] | None = None,
     ) -> list[MatchLocation]:
-        checker = self._build_checker(pattern, fixed_strings=fixed_strings, case_sensitive=case_sensitive)
+        checker = self._build_checker(
+            pattern, fixed_strings=fixed_strings, case_sensitive=case_sensitive
+        )
         out: list[MatchLocation] = []
 
         entries = self._load_or_build_symbol_index()
@@ -352,7 +350,7 @@ class SemanticSearcher:
 
     @staticmethod
     def _file_cache_key(rel: str, blob: str) -> str:
-        return hashlib.sha1(f"{rel}|{blob}".encode("utf-8")).hexdigest()
+        return hashlib.sha1(f"{rel}|{blob}".encode()).hexdigest()
 
     def _build_symbols_for_file(self, info: FileInfo, rel: str) -> list[SymbolEntry]:
         try:
@@ -509,7 +507,7 @@ class ContextExtractor:
             stripped_lines = [line.lstrip() for line in all_lines]
             indents = [
                 (len(line) - len(stripped)) if stripped else -1
-                for line, stripped in zip(all_lines, stripped_lines)
+                for line, stripped in zip(all_lines, stripped_lines, strict=False)
             ]
             total = len(all_lines)
             file_matches.sort(key=lambda m: m.line_number)
@@ -518,7 +516,9 @@ class ContextExtractor:
             for m in file_matches:
                 start = max(1, m.line_number - self.context_lines)
                 end = min(total, m.line_number + self.context_lines)
-                start, end = self._expand_to_scope(all_lines, stripped_lines, indents, m.line_number, start, end)
+                start, end = self._expand_to_scope(
+                    all_lines, stripped_lines, indents, m.line_number, start, end
+                )
                 ranges.append((start, end, [m.line_number]))
 
             for start, end, match_lines in self._merge_ranges(ranges):
@@ -562,11 +562,12 @@ class ContextExtractor:
             if not stripped:
                 continue
             indent = indents[i] if indents[i] >= 0 else 0
-            if any(stripped.startswith(kw) for kw in scope_keywords):
-                if indent <= match_indent or i == match_line - 1:
-                    found_header_line = i + 1
-                    header_indent = indent
-                    break
+            if any(stripped.startswith(kw) for kw in scope_keywords) and (
+                indent <= match_indent or i == match_line - 1
+            ):
+                found_header_line = i + 1
+                header_indent = indent
+                break
 
         if found_header_line is None:
             return current_start, current_end
@@ -574,13 +575,17 @@ class ContextExtractor:
         current_start = min(current_start, found_header_line)
         downward_end = current_end
 
-        for j in range(found_header_line, min(len(all_lines), found_header_line + self.max_snippet_lines)):
+        for j in range(
+            found_header_line, min(len(all_lines), found_header_line + self.max_snippet_lines)
+        ):
             stripped = stripped_lines[j]
             if not stripped:
                 continue
             indent = indents[j] if indents[j] >= 0 else 0
-            if j + 1 > match_line and indent <= header_indent and any(
-                stripped.startswith(kw) for kw in scope_keywords
+            if (
+                j + 1 > match_line
+                and indent <= header_indent
+                and any(stripped.startswith(kw) for kw in scope_keywords)
             ):
                 break
             downward_end = j + 1

@@ -66,10 +66,7 @@ class PyCombinedVisitor(ast.NodeVisitor):
             return name
 
         parent_scope = self.scope[-1]
-        if parent_scope == "(module)":
-            qualified_nested = name
-        else:
-            qualified_nested = f"{parent_scope}.{name}"
+        qualified_nested = name if parent_scope == "(module)" else f"{parent_scope}.{name}"
         self.nested_funcs.add(qualified_nested)
         return qualified_nested
 
@@ -105,7 +102,9 @@ def build_python_semantic_map(
 
     classes: dict[str, list[str]] = collector.classes
     inherits = collector.inherits
-    defined = set(collector.module_funcs) | set(collector.qualified_methods) | set(collector.nested_funcs)
+    defined = (
+        set(collector.module_funcs) | set(collector.qualified_methods) | set(collector.nested_funcs)
+    )
     edges = {(src, dst) for src, dst in collector.edges if dst in defined}
 
     lines: list[str] = []

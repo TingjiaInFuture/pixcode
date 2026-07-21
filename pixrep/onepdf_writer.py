@@ -58,4 +58,3 @@ class StreamingPDFWriter:
 
     def finalize(self) -> None:
         self._canvas.save()
-

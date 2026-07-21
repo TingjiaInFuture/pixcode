@@ -28,7 +28,9 @@ class QueryPreviewTUI:
         print(f"\n[query] {self.query}")
         print(f"[snippets] {len(self.snippets)}")
         self._print_list()
-        print("\nCommands: p <idx>=preview, t <idx>=toggle, a=all, n=none, l=list, r=render, q=quit")
+        print(
+            "\nCommands: p <idx>=preview, t <idx>=toggle, a=all, n=none, l=list, r=render, q=quit"
+        )
 
         while True:
             try:
