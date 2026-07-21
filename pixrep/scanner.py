@@ -30,6 +30,7 @@ class RepoScanner:
         prefer_git_source: bool = True,
         scan_workers: int | None = None,
         snapshot_path: Path | None = None,
+        snapshot_mode: str = "git-fast",
     ):
         self.root = Path(root).resolve()
         self.max_file_size = max_file_size
@@ -38,6 +39,9 @@ class RepoScanner:
         self.scan_workers = scan_workers or 8
         self._ignore_patterns = [*DEFAULT_IGNORE_PATTERNS, *self.extra_ignore]
         self._ignore_match = compile_ignore_matcher(self._ignore_patterns)
+        # "git-fast": distrust the snapshot for files git reports as dirty, so a
+        # tool that preserves mtime+size while changing content can't fool us.
+        self._snapshot_mode = snapshot_mode
         # Per-file snapshot for the warm-cache fast path (ONEPDF snapshot):
         # unchanged (mtime, size) → reuse sha256/line_count/is_text without
         # reading the file body.
@@ -166,6 +170,38 @@ class RepoScanner:
             return None
         return paths, oid_map
 
+    def _git_dirty_set(self) -> set[str]:
+        """Repo-relative posix paths git reports as modified/untracked, so the
+        snapshot fast path can distrust their mtime+size."""
+        try:
+            proc = subprocess.run(
+                ["git", "status", "--porcelain=v2", "-z"],
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return set()
+        if proc.returncode != 0:
+            return set()
+        dirty: set[str] = set()
+        for entry in proc.stdout.split("\0"):
+            if not entry:
+                continue
+            parts = entry.split(" ")
+            if not parts:
+                continue
+            path = parts[-1]
+            if parts[0] == "?" and len(parts) >= 2:
+                path = parts[1]
+            if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+                path = path[1:-1]
+            if path:
+                dirty.add(normalize_posix_path(path))
+        return dirty
+
     def _walk_files(self):
         for dirpath, dirnames, filenames in os.walk(self.root):
             dirnames[:] = sorted(d for d in dirnames if not should_ignore_dir(d))
@@ -177,9 +213,12 @@ class RepoScanner:
         filepath: Path,
         include_content: bool,
         oid_map: dict[str, str] | None = None,
+        dirty: set[str] | None = None,
     ) -> tuple[str, FileInfo | None]:
         if oid_map is None:
             oid_map = {}
+        if dirty is None:
+            dirty = set()
         try:
             rel_path = filepath.relative_to(self.root)
         except ValueError:
@@ -211,6 +250,7 @@ class RepoScanner:
             and snap.get("mtime_ns") == mtime_ns
             and snap.get("size") == size
             and snap.get("schema") == SNAPSHOT_SCHEMA_VERSION
+            and rel_posix not in dirty
         ):
             if not snap.get("is_text", True):
                 return ("skipped_binary", None)
@@ -328,10 +368,18 @@ class RepoScanner:
             candidates = list(self._walk_files())
         scan_stats["seen_files"] = len(candidates)
 
+        # git-fast: distrust the snapshot for files git reports as dirty, so a
+        # tool that preserves mtime+size while changing content can't fool us.
+        dirty = (
+            self._git_dirty_set()
+            if self._snapshot_mode == "git-fast" and repo.source_mode == "git"
+            else set()
+        )
+
         max_workers = max(1, min(self.scan_workers, len(candidates) or 1))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             for status, info in pool.map(
-                lambda p: self._scan_one_file(p, include_content, oid_map), candidates
+                lambda p: self._scan_one_file(p, include_content, oid_map, dirty), candidates
             ):
                 if status == "ok" and info is not None:
                     files.append(info)

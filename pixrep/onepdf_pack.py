@@ -423,9 +423,28 @@ def _dependency_order(files: list[PackedFile]) -> None:
     files.sort(key=lambda f: (-popularity[f.rel_posix], _importance_key(f)))
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_name("." + path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
 def _onepdf_build_signature(
     files: list[PackedFile],
     *,
+    repo_name: str,
     profile: str,
     deterministic: bool,
     order: str,
@@ -434,13 +453,18 @@ def _onepdf_build_signature(
     wrap: bool,
     include_tree: bool,
     include_index: bool,
+    font_size: int,
+    leading: int,
+    page_height: int,
 ) -> str:
     """Fingerprint of every input that affects the ONEPDF output bytes. If it
     matches the previous build and the output exists, the whole PDF render is
     skipped (--incremental)."""
     parts = [
+        f"repo={repo_name}",
         f"profile={profile}|det={int(deterministic)}|order={order}",
         f"tab={tab_size}|cols={max_cols}|wrap={int(wrap)}",
+        f"font={font_size}|leading={leading}|page={page_height}",
         f"tree={int(include_tree)}|index={int(include_index)}",
         f"schema={ONEPDF_BLOCK_SCHEMA_VERSION}|{RENDER_SCHEMA_VERSION}|{__version__}",
     ]
@@ -495,12 +519,20 @@ def pack_repo_to_one_pdf(
     else:
         files.sort(key=lambda x: (x.rel_posix,))
 
+    font_size = 7
+    leading = 9
+    top = 36
+    bottom = 36
+    page_height = 842
+    max_lines = max(1, int((page_height - top - bottom) / leading))
+
     # --incremental: if the build signature is unchanged and the output exists,
     # skip the whole PDF render.
     sig = ""
     if incremental:
         sig = _onepdf_build_signature(
             files,
+            repo_name=repo_root.name,
             profile=profile,
             deterministic=deterministic,
             order=order,
@@ -509,26 +541,28 @@ def pack_repo_to_one_pdf(
             wrap=wrap,
             include_tree=include_tree,
             include_index=include_index,
+            font_size=font_size,
+            leading=leading,
+            page_height=page_height,
         )
         sig_path = out_pdf.with_name(out_pdf.name + ".buildsig")
         if out_pdf.exists() and sig_path.exists():
             try:
-                if sig_path.read_text(encoding="utf-8").strip() == sig:
-                    stats["skipped_incremental"] = 1
-                    stats["output_bytes"] = int(out_pdf.stat().st_size)
-                    return stats
-            except OSError:
+                meta = json.loads(sig_path.read_text(encoding="utf-8"))
+                if meta.get("input_signature") == sig:
+                    actual_size = out_pdf.stat().st_size
+                    if meta.get("output_size") == actual_size and meta.get(
+                        "output_sha256"
+                    ) == _sha256_file(out_pdf):
+                        stats["skipped_incremental"] = 1
+                        stats["output_bytes"] = actual_size
+                        stats["pages"] = int(meta.get("pages", 0))
+                        return stats
+            except (OSError, json.JSONDecodeError):
                 pass
 
     compact = profile in {"compact", "semantic"}
     strip_docs = profile == "semantic"
-
-    font_size = 7
-    leading = 9
-    top = 36
-    bottom = 36
-    page_height = 842
-    max_lines = max(1, int((page_height - top - bottom) / leading))
 
     current: list[str] = []
     writer = StreamingPDFWriter(
@@ -597,6 +631,12 @@ def pack_repo_to_one_pdf(
     stats["output_bytes"] = int(out_pdf.stat().st_size) if out_pdf.exists() else 0
     if incremental:
         sig_path = out_pdf.with_name(out_pdf.name + ".buildsig")
+        meta = {
+            "input_signature": sig,
+            "output_sha256": _sha256_file(out_pdf) if out_pdf.exists() else "",
+            "output_size": out_pdf.stat().st_size if out_pdf.exists() else 0,
+            "pages": writer.page_count,
+        }
         with contextlib.suppress(OSError):
-            sig_path.write_text(sig, encoding="utf-8")
+            _atomic_write_text(sig_path, json.dumps(meta, ensure_ascii=False))
     return stats

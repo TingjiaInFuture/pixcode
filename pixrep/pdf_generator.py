@@ -160,8 +160,7 @@ class PDFGenerator:
         log.info("Done! Generated %d %ss (+ index)", success_count, fmt_label)
 
     def generate_index_only(self) -> None:
-        """Generate only the index file into output_dir."""
-        self.insight_engine.enrich_repo()
+        """Generate only the index file into output_dir (no semantic/lint)."""
         self._generate_index()
 
     def _needs_regeneration(self, info: FileInfo, manifest: BuildManifest) -> bool:
