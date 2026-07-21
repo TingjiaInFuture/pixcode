@@ -342,6 +342,11 @@ Examples:
             help="File ordering (default: importance) / 文件排序",
         )
         p.add_argument(
+            "--incremental",
+            action="store_true",
+            help="Skip PDF render when the build signature is unchanged / 构建签名不变时跳过渲染",
+        )
+        p.add_argument(
             "--no-tree",
             action="store_true",
             help="Do not include directory tree section / 不包含目录树",
@@ -418,6 +423,7 @@ def _scan_repo(
         str(repo_path),
         max_file_size=args.max_size * 1024,
         extra_ignore=args.ignore,
+        snapshot_path=_snapshot_path(repo_path),
     )
     repo = scanner.scan(include_content=include_content)
     if not repo.files:
@@ -505,26 +511,31 @@ def _run_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _onepdf_cache_dir(repo_root: Path) -> Path:
-    """Resolve the ONEPDF block-cache directory (mirrors the cache root used by
-    the semantic/lint caches)."""
+def _resolve_cache_root(repo_root: Path) -> Path:
+    """Resolve the per-repo cache root (PIXREP_CACHE_DIR / LOCALAPPDATA / XDG /
+    ~/.cache), shared by the semantic/lint/snapshot/onepdf caches."""
     env = os.environ.get("PIXREP_CACHE_DIR", "").strip()
     if env:
-        base = Path(env).expanduser().resolve() / repo_root.name
-    elif os.name == "nt":
-        base = (
+        return Path(env).expanduser().resolve() / repo_root.name
+    if os.name == "nt":
+        return (
             Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
             / "pixrep"
             / "cache"
             / repo_root.name
         )
-    else:
-        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
-        if xdg:
-            base = Path(xdg).expanduser().resolve() / "pixrep" / repo_root.name
-        else:
-            base = Path.home() / ".cache" / "pixrep" / repo_root.name
-    return base / "onepdf" / "blocks"
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser().resolve() / "pixrep" / repo_root.name
+    return Path.home() / ".cache" / "pixrep" / repo_root.name
+
+
+def _onepdf_cache_dir(repo_root: Path) -> Path:
+    return _resolve_cache_root(repo_root) / "onepdf" / "blocks"
+
+
+def _snapshot_path(repo_root: Path) -> Path:
+    return _resolve_cache_root(repo_root) / "snapshot.json"
 
 
 def _run_onepdf(args: argparse.Namespace) -> int:
@@ -554,6 +565,8 @@ def _run_onepdf(args: argparse.Namespace) -> int:
         deterministic=args.deterministic,
         order=args.order,
         cache_dir=_onepdf_cache_dir(repo_path),
+        snapshot_path=_snapshot_path(repo_path),
+        incremental=args.incremental,
     )
     log.info(
         "onepdf summary: seen=%d, included=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d, pages=%d, output=%d bytes",

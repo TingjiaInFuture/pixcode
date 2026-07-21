@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .constants import ONEPDF_BLOCK_SCHEMA_VERSION
+from .constants import ONEPDF_BLOCK_SCHEMA_VERSION, RENDER_SCHEMA_VERSION
 from .file_utils import (
     build_tree,
     char_display_width,
@@ -19,6 +19,7 @@ from .file_utils import (
 )
 from .onepdf_writer import StreamingPDFWriter
 from .scanner import RepoScanner
+from .version import __version__
 
 DEFAULT_CORE_IGNORE_PATTERNS = [
     # Docs / meta
@@ -62,6 +63,7 @@ def collect_core_files(
     core_only: bool = True,
     prefer_git: bool = True,
     include_patterns: list[str] | None = None,
+    snapshot_path: Path | None = None,
 ) -> tuple[list[PackedFile], dict[str, int]]:
     """
     Collect (mostly) code files for ONEPDF_CORE.
@@ -90,6 +92,7 @@ def collect_core_files(
         max_file_size=max_file_size,
         extra_ignore=combined_ignore,
         prefer_git_source=prefer_git,
+        snapshot_path=snapshot_path,
     )
     repo = scanner.scan(include_content=False)
 
@@ -420,6 +423,32 @@ def _dependency_order(files: list[PackedFile]) -> None:
     files.sort(key=lambda f: (-popularity[f.rel_posix], _importance_key(f)))
 
 
+def _onepdf_build_signature(
+    files: list[PackedFile],
+    *,
+    profile: str,
+    deterministic: bool,
+    order: str,
+    tab_size: int,
+    max_cols: int,
+    wrap: bool,
+    include_tree: bool,
+    include_index: bool,
+) -> str:
+    """Fingerprint of every input that affects the ONEPDF output bytes. If it
+    matches the previous build and the output exists, the whole PDF render is
+    skipped (--incremental)."""
+    parts = [
+        f"profile={profile}|det={int(deterministic)}|order={order}",
+        f"tab={tab_size}|cols={max_cols}|wrap={int(wrap)}",
+        f"tree={int(include_tree)}|index={int(include_index)}",
+        f"schema={ONEPDF_BLOCK_SCHEMA_VERSION}|{RENDER_SCHEMA_VERSION}|{__version__}",
+    ]
+    for f in files:
+        parts.append(f"{f.rel_posix}:{f.git_blob}:{f.language}")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
 def pack_repo_to_one_pdf(
     repo_root: Path,
     out_pdf: Path,
@@ -437,6 +466,8 @@ def pack_repo_to_one_pdf(
     deterministic: bool = False,
     order: str = "importance",
     cache_dir: Path | None = None,
+    snapshot_path: Path | None = None,
+    incremental: bool = False,
 ) -> dict[str, int]:
     """Pack repository files into a single minimized PDF (ONEPDF_CORE).
 
@@ -455,6 +486,7 @@ def pack_repo_to_one_pdf(
         core_only=core_only,
         prefer_git=prefer_git,
         include_patterns=include_patterns,
+        snapshot_path=snapshot_path,
     )
     if order == "dependency":
         _dependency_order(files)
@@ -462,6 +494,31 @@ def pack_repo_to_one_pdf(
         files.sort(key=_importance_key)
     else:
         files.sort(key=lambda x: (x.rel_posix,))
+
+    # --incremental: if the build signature is unchanged and the output exists,
+    # skip the whole PDF render.
+    sig = ""
+    if incremental:
+        sig = _onepdf_build_signature(
+            files,
+            profile=profile,
+            deterministic=deterministic,
+            order=order,
+            tab_size=tab_size,
+            max_cols=max_cols,
+            wrap=wrap,
+            include_tree=include_tree,
+            include_index=include_index,
+        )
+        sig_path = out_pdf.with_name(out_pdf.name + ".buildsig")
+        if out_pdf.exists() and sig_path.exists():
+            try:
+                if sig_path.read_text(encoding="utf-8").strip() == sig:
+                    stats["skipped_incremental"] = 1
+                    stats["output_bytes"] = int(out_pdf.stat().st_size)
+                    return stats
+            except OSError:
+                pass
 
     compact = profile in {"compact", "semantic"}
     strip_docs = profile == "semantic"
@@ -538,4 +595,8 @@ def pack_repo_to_one_pdf(
     writer.finalize()
     stats["pages"] = writer.page_count
     stats["output_bytes"] = int(out_pdf.stat().st_size) if out_pdf.exists() else 0
+    if incremental:
+        sig_path = out_pdf.with_name(out_pdf.name + ".buildsig")
+        with contextlib.suppress(OSError):
+            sig_path.write_text(sig, encoding="utf-8")
     return stats

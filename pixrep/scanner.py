@@ -1,11 +1,12 @@
 import concurrent.futures
 import hashlib
+import json
 import logging
 import os
 import subprocess
 from pathlib import Path
 
-from .constants import DEFAULT_IGNORE_PATTERNS
+from .constants import DEFAULT_IGNORE_PATTERNS, SNAPSHOT_SCHEMA_VERSION
 from .file_utils import (
     build_tree,
     compile_ignore_matcher,
@@ -28,6 +29,7 @@ class RepoScanner:
         extra_ignore: list[str] | None = None,
         prefer_git_source: bool = True,
         scan_workers: int | None = None,
+        snapshot_path: Path | None = None,
     ):
         self.root = Path(root).resolve()
         self.max_file_size = max_file_size
@@ -36,6 +38,32 @@ class RepoScanner:
         self.scan_workers = scan_workers or 8
         self._ignore_patterns = [*DEFAULT_IGNORE_PATTERNS, *self.extra_ignore]
         self._ignore_match = compile_ignore_matcher(self._ignore_patterns)
+        # Per-file snapshot for the warm-cache fast path (ONEPDF snapshot):
+        # unchanged (mtime, size) → reuse sha256/line_count/is_text without
+        # reading the file body.
+        self._snapshot_path = snapshot_path
+        self._snapshot: dict[str, dict] = self._load_snapshot()
+        self._snapshot_dirty = False
+
+    def _load_snapshot(self) -> dict[str, dict]:
+        if not self._snapshot_path or not self._snapshot_path.exists():
+            return {}
+        try:
+            data = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_snapshot(self) -> None:
+        if not self._snapshot_path or not self._snapshot_dirty:
+            return
+        try:
+            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._snapshot_path.with_name("." + self._snapshot_path.name + ".tmp")
+            tmp.write_text(json.dumps(self._snapshot), encoding="utf-8")
+            os.replace(tmp, self._snapshot_path)
+        except OSError:
+            log.debug("failed to save scanner snapshot", exc_info=True)
 
     def _should_ignore_file(self, rel_posix: str, filename: str) -> bool:
         _ = filename
@@ -161,28 +189,60 @@ class RepoScanner:
         if size > self.max_file_size or size == 0:
             return ("skipped_size_or_empty", None)
 
-        # Single read for both content-aware and metadata-only scans (P1-3):
-        # one read_bytes() serves binary detection + line count (+ decode when
-        # content is requested). Replaces the prior 8 KB sample + mmap(mm[:])
-        # double-read that copied the whole file into a bytes object anyway.
+        git_index_oid = oid_map.get(rel_posix)
+        language = self._detect_language(filepath)
+
+        # Snapshot fast path (ONEPDF snapshot): when (mtime, size) is unchanged
+        # and the schema matches, reuse the cached sha256 / line_count / is_text
+        # and avoid reading the file body — warm caches approach O(changed bytes).
+        snap = self._snapshot.get(rel_posix)
+        if (
+            snap
+            and snap.get("mtime_ns") == mtime_ns
+            and snap.get("size") == size
+            and snap.get("schema") == SNAPSHOT_SCHEMA_VERSION
+        ):
+            if not snap.get("is_text", True):
+                return ("skipped_binary", None)
+            content = ""
+            if include_content:
+                blob = self._read_bytes(filepath)
+                if blob is None:
+                    return ("skipped_unreadable", None)
+                content = blob.decode(encoding="utf-8", errors="replace")
+            return (
+                "ok",
+                FileInfo(
+                    path=rel_path,
+                    abs_path=filepath,
+                    language=language,
+                    size=size,
+                    mtime_ns=mtime_ns,
+                    line_count=snap["line_count"],
+                    content=content,
+                    git_blob=snap["sha256"],
+                    git_index_oid=git_index_oid,
+                ),
+            )
+
+        # Miss: read the file body once for binary detection + line count +
+        # content hash (single read, P1-3).
         blob = self._read_bytes(filepath)
         if blob is None:
             return ("skipped_unreadable", None)
         if not is_probably_text(blob[:8192]):
+            self._record_snapshot(rel_posix, mtime_ns, size, "", 0, is_text=False)
             return ("skipped_binary", None)
         line_count = line_count_from_bytes(blob)
         content = blob.decode(encoding="utf-8", errors="replace") if include_content else ""
-
-        # Content fingerprint of the actual working-tree bytes (P0-1): we hash
-        # what we render, not the git index OID (which can lag uncommitted
-        # edits and cause --incremental to skip changed files).
+        # Content fingerprint of the actual working-tree bytes (P0-1).
         git_blob = hashlib.sha256(blob).hexdigest()
-        git_index_oid = oid_map.get(rel_posix)
+        self._record_snapshot(rel_posix, mtime_ns, size, git_blob, line_count, is_text=True)
 
         info = FileInfo(
             path=rel_path,
             abs_path=filepath,
-            language=self._detect_language(filepath),
+            language=language,
             size=size,
             mtime_ns=mtime_ns,
             line_count=line_count,
@@ -191,6 +251,28 @@ class RepoScanner:
             git_index_oid=git_index_oid,
         )
         return ("ok", info)
+
+    def _record_snapshot(
+        self,
+        rel_posix: str,
+        mtime_ns: int,
+        size: int,
+        sha256: str,
+        line_count: int,
+        *,
+        is_text: bool,
+    ) -> None:
+        if not self._snapshot_path:
+            return
+        self._snapshot[rel_posix] = {
+            "mtime_ns": mtime_ns,
+            "size": size,
+            "schema": SNAPSHOT_SCHEMA_VERSION,
+            "sha256": sha256,
+            "line_count": line_count,
+            "is_text": is_text,
+        }
+        self._snapshot_dirty = True
 
     def scan_files(
         self,
@@ -264,6 +346,7 @@ class RepoScanner:
         )
         repo.tree_str = self._build_tree(files)
         repo.scan_stats = scan_stats
+        self._save_snapshot()
         return repo
 
     def _build_tree(self, files: list[FileInfo]) -> str:
