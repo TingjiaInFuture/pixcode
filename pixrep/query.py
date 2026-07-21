@@ -389,42 +389,47 @@ class SemanticSearcher:
         except (SyntaxError, OSError):
             return []
 
-        lines = content.split("\n")
-        class_by_node: dict[int, str] = {}
-        for parent in ast.walk(tree):
-            if isinstance(parent, ast.ClassDef):
-                for child in parent.body:
-                    class_by_node[id(child)] = parent.name
+        try:
+            lines = content.split("\n")
+            class_by_node: dict[int, str] = {}
+            for parent in ast.walk(tree):
+                if isinstance(parent, ast.ClassDef):
+                    for child in parent.body:
+                        class_by_node[id(child)] = parent.name
 
-        file_entries: list[SymbolEntry] = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ClassDef):
-                line_no = max(1, int(getattr(node, "lineno", 1)))
-                file_entries.append(
-                    SymbolEntry(
-                        rel_path=rel,
-                        line_number=line_no,
-                        line_text=_line_at(lines, line_no),
-                        name=node.name,
-                        qualified=node.name,
-                        kind="class",
+            file_entries: list[SymbolEntry] = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    line_no = max(1, int(getattr(node, "lineno", 1)))
+                    file_entries.append(
+                        SymbolEntry(
+                            rel_path=rel,
+                            line_number=line_no,
+                            line_text=_line_at(lines, line_no),
+                            name=node.name,
+                            qualified=node.name,
+                            kind="class",
+                        )
                     )
-                )
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                owner = class_by_node.get(id(node), "")
-                qualified = f"{owner}.{node.name}" if owner else node.name
-                line_no = max(1, int(getattr(node, "lineno", 1)))
-                file_entries.append(
-                    SymbolEntry(
-                        rel_path=rel,
-                        line_number=line_no,
-                        line_text=_line_at(lines, line_no),
-                        name=node.name,
-                        qualified=qualified,
-                        kind="function",
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    owner = class_by_node.get(id(node), "")
+                    qualified = f"{owner}.{node.name}" if owner else node.name
+                    line_no = max(1, int(getattr(node, "lineno", 1)))
+                    file_entries.append(
+                        SymbolEntry(
+                            rel_path=rel,
+                            line_number=line_no,
+                            line_text=_line_at(lines, line_no),
+                            name=node.name,
+                            qualified=qualified,
+                            kind="function",
+                        )
                     )
-                )
-        return file_entries
+            return file_entries
+        finally:
+            # Drop the parsed text so cold-cache scans don't accumulate every
+            # Python file's content in memory.
+            info.release_content()
 
     def _load_file_cache(self, cache_path: Path) -> list[SymbolEntry] | None:
         if not cache_path.exists():

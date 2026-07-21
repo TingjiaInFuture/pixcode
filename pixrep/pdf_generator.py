@@ -326,9 +326,10 @@ class PDFGenerator:
         """生成单个源文件的输出（PDF 或 PNG），返回输出文件名列表。"""
         out_name = self._file_out_name(file_info)
         out_path = self.output_dir / out_name
-        if self.output_format == "pdf" and file_info.size >= self.streaming_file_threshold:
-            # Large files: render directly on a canvas without holding the full
-            # Platypus story in memory (P1-5).
+        if self.output_format == "pdf":
+            # All per-file PDFs render directly on a canvas without holding the
+            # full Platypus story in memory (P1-5). Platypus is reserved for the
+            # index page.
             outputs = self._render_file_direct(file_info, out_path)
         else:
             story = self._build_file_story(file_info)

@@ -45,11 +45,6 @@ class CodeInsightEngine:
         self._scanned_paths_ci = (
             {k.lower(): k for k in self._scanned_paths} if os.name == "nt" else {}
         )
-        # rel -> content fingerprint (git blob OID or sha1), used as the cache
-        # identity for lint (and available for any per-file cache).
-        self._blob_by_rel = {
-            self._normalize_path(info.path): info.git_blob for info in self.repo.files
-        }
         self._cache_root = self._resolve_cache_root()
         self._semantic_cache_dir = self._cache_root / "semantic"
         self._lint_cache_dir = self._cache_root / "lint"
@@ -190,18 +185,57 @@ class CodeInsightEngine:
             return None
 
     def _collect_ruff(self, files: list[FileInfo], deadline: float) -> dict[str, list[LintIssue]]:
-        issues: dict[str, list[LintIssue]] = defaultdict(list)
         if not shutil.which("ruff"):
             return {}
-        targets = [self._normalize_path(info.path) for info in files if info.language == "python"]
-        if not targets:
+        rel_files = [(self._normalize_path(f.path), f) for f in files if f.language == "python"]
+        if not rel_files:
             return {}
+        return self._collect_per_file_lint("ruff", rel_files, deadline, self._run_ruff_batch)
 
-        cache_key = self._tool_cache_key("ruff", targets)
-        cached = self._load_lint_cache("ruff", cache_key)
-        if cached is not None:
-            return cached
+    def _collect_eslint(self, files: list[FileInfo], deadline: float) -> dict[str, list[LintIssue]]:
+        if not shutil.which("eslint"):
+            return {}
+        rel_files = [
+            (self._normalize_path(f.path), f)
+            for f in files
+            if f.language in {"javascript", "typescript"}
+        ]
+        if not rel_files:
+            return {}
+        return self._collect_per_file_lint("eslint", rel_files, deadline, self._run_eslint_batch)
 
+    def _collect_per_file_lint(
+        self,
+        tool: str,
+        rel_files: list[tuple[str, FileInfo]],
+        deadline: float,
+        run_batch,
+    ) -> dict[str, list[LintIssue]]:
+        """Per-file lint cache (P1-1): only files whose content fingerprint
+        changed are re-linted; the rest reuse cached results. The linter still
+        runs once per batch over the miss set (amortising process startup)."""
+        issues: dict[str, list[LintIssue]] = defaultdict(list)
+        cache_dir = self._per_file_cache_dir(tool)
+        misses: list[tuple[str, FileInfo]] = []
+        for rel, info in rel_files:
+            blob = info.git_blob or f"ns{info.mtime_ns}|sz{info.size}"
+            cached = self._load_per_file_lint(cache_dir / f"{blob}.json", tool)
+            if cached is None:
+                misses.append((rel, info))
+            else:
+                issues[rel].extend(cached)
+
+        if misses:
+            fresh = run_batch([rel for rel, _ in misses], deadline)
+            for rel, info in misses:
+                blob = info.git_blob or f"ns{info.mtime_ns}|sz{info.size}"
+                file_issues = fresh.get(rel, [])
+                self._save_per_file_lint(cache_dir / f"{blob}.json", tool, file_issues)
+                issues[rel].extend(file_issues)
+        return dict(issues)
+
+    def _run_ruff_batch(self, targets: list[str], deadline: float) -> dict[str, list[LintIssue]]:
+        issues: dict[str, list[LintIssue]] = defaultdict(list)
         for batch in iter_target_batches(targets):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -211,12 +245,11 @@ class CodeInsightEngine:
             if not data:
                 continue
             for item in data:
-                filename = item.get("filename")
                 location = item.get("location", {})
                 row = int(location.get("row", 1))
                 code = str(item.get("code", "RUFF"))
                 message = str(item.get("message", "ruff finding"))
-                rel = self._relative_to_repo(filename)
+                rel = self._relative_to_repo(item.get("filename"))
                 if not rel:
                     continue
                 issues[rel].append(
@@ -228,37 +261,15 @@ class CodeInsightEngine:
                         message=message,
                     )
                 )
-        result = dict(issues)
-        self._save_lint_cache("ruff", cache_key, result)
-        return result
+        return dict(issues)
 
-    def _collect_eslint(self, files: list[FileInfo], deadline: float) -> dict[str, list[LintIssue]]:
+    def _run_eslint_batch(self, targets: list[str], deadline: float) -> dict[str, list[LintIssue]]:
         issues: dict[str, list[LintIssue]] = defaultdict(list)
-        if not shutil.which("eslint"):
-            return {}
-        targets = [
-            self._normalize_path(info.path)
-            for info in files
-            if info.language in {"javascript", "typescript"}
-        ]
-        if not targets:
-            return {}
-
-        cache_key = self._tool_cache_key("eslint", targets)
-        cached = self._load_lint_cache("eslint", cache_key)
-        if cached is not None:
-            return cached
-
         for batch in iter_target_batches(targets):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            cmd = [
-                "eslint",
-                "--format",
-                "json",
-                *batch,
-            ]
+            cmd = ["eslint", "--format", "json", *batch]
             files_json = self._run_json_command(
                 cmd, cwd=self.repo.root, tool="eslint", timeout=remaining
             )
@@ -282,9 +293,66 @@ class CodeInsightEngine:
                             message=text,
                         )
                     )
-        result = dict(issues)
-        self._save_lint_cache("eslint", cache_key, result)
-        return result
+        return dict(issues)
+
+    def _per_file_cache_dir(self, tool: str) -> Path:
+        # options_hash already folds in the linter version + config signature,
+        # so it forms the per-config namespace for lint caches.
+        config_hash = hashlib.sha1(f"{tool}|{self._options_hash}".encode()).hexdigest()[:16]
+        d = self._lint_cache_dir / tool / config_hash
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _load_per_file_lint(self, path: Path, tool: str) -> list[LintIssue] | None:
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, list):
+            return None
+        return [
+            LintIssue(
+                line=int(it.get("line", 1)),
+                severity=str(it.get("severity", "medium")),
+                tool=str(it.get("tool", tool)),
+                code=str(it.get("code", tool.upper())),
+                message=str(it.get("message", "")),
+            )
+            for it in raw
+        ]
+
+    def _save_per_file_lint(self, path: Path, tool: str, issues: list[LintIssue]) -> None:
+        payload = [
+            {
+                "line": i.line,
+                "severity": i.severity,
+                "tool": i.tool,
+                "code": i.code,
+                "message": i.message,
+            }
+            for i in issues
+        ]
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                delete=False,
+                dir=str(path.parent),
+                prefix=".",
+                suffix=".tmp",
+            ) as tmp:
+                tmp.write(json.dumps(payload, ensure_ascii=False))
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                tmp_path = Path(tmp.name)
+            os.replace(tmp_path, path)
+        except OSError:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink(missing_ok=True)
 
     def _build_semantic_map(self, info: FileInfo) -> SemanticMap:
         # Text-like languages yield no semantic map; skip reading content for
@@ -402,76 +470,6 @@ class CodeInsightEngine:
             blob = f"ns{int(info.mtime_ns)}|sz{int(info.size)}"
         sig = f"{self._options_hash}|{rel}|{blob}|v3"
         return hashlib.sha1(sig.encode("utf-8")).hexdigest()
-
-    def _tool_cache_key(self, tool: str, targets: list[str]) -> str:
-        h = hashlib.sha1()
-        h.update(f"{tool}|{self._options_hash}|v3|".encode())
-        for rel in sorted(set(targets)):
-            blob = self._blob_by_rel.get(rel)
-            if blob:
-                h.update(f"{rel}|{blob}\n".encode())
-            else:
-                h.update(f"{rel}|missing\n".encode())
-        return h.hexdigest()
-
-    def _load_lint_cache(self, tool: str, key: str) -> dict[str, list[LintIssue]] | None:
-        path = self._lint_cache_dir / f"{tool}_{key}.json"
-        if not path.exists():
-            return None
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-
-        restored: dict[str, list[LintIssue]] = {}
-        for rel, entries in raw.items():
-            restored[rel] = [
-                LintIssue(
-                    line=int(item.get("line", 1)),
-                    severity=str(item.get("severity", "medium")),
-                    tool=str(item.get("tool", tool)),
-                    code=str(item.get("code", tool.upper())),
-                    message=str(item.get("message", "")),
-                )
-                for item in entries
-            ]
-        return restored
-
-    def _save_lint_cache(self, tool: str, key: str, issues: dict[str, list[LintIssue]]) -> None:
-        path = self._lint_cache_dir / f"{tool}_{key}.json"
-        payload = {
-            rel: [
-                {
-                    "line": issue.line,
-                    "severity": issue.severity,
-                    "tool": issue.tool,
-                    "code": issue.code,
-                    "message": issue.message,
-                }
-                for issue in rel_issues
-            ]
-            for rel, rel_issues in issues.items()
-        }
-        tmp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                delete=False,
-                dir=str(self._lint_cache_dir),
-                prefix=f".{tool}_{key}.",
-                suffix=".tmp",
-            ) as tmp:
-                tmp.write(json.dumps(payload, ensure_ascii=False))
-                tmp.flush()
-                os.fsync(tmp.fileno())
-                tmp_path = Path(tmp.name)
-            os.replace(tmp_path, path)
-        except OSError:
-            if tmp_path is not None:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink(missing_ok=True)
-            return
 
     @staticmethod
     def _limit_semantic_lines(lines: list[str]) -> tuple[list[str], bool]:
