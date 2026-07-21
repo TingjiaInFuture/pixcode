@@ -65,6 +65,16 @@ class RepoScanner:
         except OSError:
             log.debug("failed to save scanner snapshot", exc_info=True)
 
+    def _prune_snapshot(self, files: list[FileInfo]) -> None:
+        if not self._snapshot_path:
+            return
+        current = {normalize_posix_path(f.path) for f in files}
+        stale = [rel for rel in self._snapshot if rel not in current]
+        for rel in stale:
+            self._snapshot.pop(rel, None)
+        if stale:
+            self._snapshot_dirty = True
+
     def _should_ignore_file(self, rel_posix: str, filename: str) -> bool:
         _ = filename
         return self._ignore_match(rel_posix)
@@ -346,6 +356,7 @@ class RepoScanner:
         )
         repo.tree_str = self._build_tree(files)
         repo.scan_stats = scan_stats
+        self._prune_snapshot(files)
         self._save_snapshot()
         return repo
 

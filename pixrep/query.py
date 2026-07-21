@@ -20,7 +20,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .constants import DEFAULT_IGNORE_PATTERNS
-from .file_utils import compile_ignore_matcher, normalize_posix_path, should_ignore_dir
+from .file_utils import (
+    compile_ignore_matcher,
+    normalize_posix_path,
+    resolve_repo_cache_root,
+    should_ignore_dir,
+)
 from .models import FileInfo, RepoInfo
 
 log = logging.getLogger(__name__)
@@ -310,18 +315,7 @@ class SemanticSearcher:
         self._files_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _resolve_cache_root(self) -> Path:
-        env = os.environ.get("PIXREP_CACHE_DIR", "").strip()
-        if env:
-            return Path(env).expanduser().resolve() / self.repo.name / "query"
-
-        if os.name == "nt":
-            base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-            return base / "pixrep" / "cache" / self.repo.name / "query"
-
-        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
-        if xdg:
-            return Path(xdg).expanduser().resolve() / "pixrep" / self.repo.name / "query"
-        return Path.home() / ".cache" / "pixrep" / self.repo.name / "query"
+        return resolve_repo_cache_root(self.repo.root) / "query"
 
     def search(
         self,

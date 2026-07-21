@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import os
 import re
 import unicodedata
 from pathlib import Path, PurePosixPath
@@ -91,6 +93,28 @@ def char_display_width(ch: str) -> int:
 
 def display_width(text: str) -> int:
     return sum(char_display_width(c) for c in text)
+
+
+def resolve_repo_cache_root(repo_root: Path) -> Path:
+    """Per-repo cache root, namespaced by the resolved path so two repos that
+    share a basename never collide (e.g. company-a/backend vs company-b/backend)."""
+    resolved = str(repo_root.resolve())
+    repo_id = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+    cache_name = f"{repo_root.name}-{repo_id}"
+    env = os.environ.get("PIXREP_CACHE_DIR", "").strip()
+    if env:
+        return Path(env).expanduser().resolve() / cache_name
+    if os.name == "nt":
+        return (
+            Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+            / "pixrep"
+            / "cache"
+            / cache_name
+        )
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser().resolve() / "pixrep" / cache_name
+    return Path.home() / ".cache" / "pixrep" / cache_name
 
 
 def line_count_from_bytes(blob: bytes) -> int:

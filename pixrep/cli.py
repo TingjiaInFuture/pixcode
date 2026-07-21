@@ -1,11 +1,10 @@
 import argparse
 import logging
-import os
 import re
 import sys
 from pathlib import Path
 
-from .file_utils import normalize_posix_path
+from .file_utils import normalize_posix_path, resolve_repo_cache_root
 from .models import RepoInfo
 from .onepdf import pack_repo_to_one_pdf
 from .pdf_generator import PDFGenerator
@@ -512,22 +511,8 @@ def _run_list(args: argparse.Namespace) -> int:
 
 
 def _resolve_cache_root(repo_root: Path) -> Path:
-    """Resolve the per-repo cache root (PIXREP_CACHE_DIR / LOCALAPPDATA / XDG /
-    ~/.cache), shared by the semantic/lint/snapshot/onepdf caches."""
-    env = os.environ.get("PIXREP_CACHE_DIR", "").strip()
-    if env:
-        return Path(env).expanduser().resolve() / repo_root.name
-    if os.name == "nt":
-        return (
-            Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-            / "pixrep"
-            / "cache"
-            / repo_root.name
-        )
-    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
-    if xdg:
-        return Path(xdg).expanduser().resolve() / "pixrep" / repo_root.name
-    return Path.home() / ".cache" / "pixrep" / repo_root.name
+    """Per-repo cache root shared by the semantic/lint/snapshot/onepdf caches."""
+    return resolve_repo_cache_root(repo_root)
 
 
 def _onepdf_cache_dir(repo_root: Path) -> Path:

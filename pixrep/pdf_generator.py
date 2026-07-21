@@ -212,8 +212,10 @@ class PDFGenerator:
         for info in self.repo.files:
             rel = normalize_posix_path(info.path)
             if rel in failed_rels:
-                # Render failed: leave the previous entry untouched so the next
-                # run re-attempts (git_blob mismatch). Never write the new hash.
+                # Render failed: drop the entry so the next run re-attempts it
+                # (a missing entry always triggers regeneration). Never write
+                # the new hash against the stale output.
+                manifest.files.pop(rel, None)
                 continue
             new_outputs = rendered_outputs.get(rel)
             old = manifest.files.get(rel)

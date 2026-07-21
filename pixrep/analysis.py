@@ -14,7 +14,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .constants import LINT_CACHE_SCHEMA_VERSION
-from .file_utils import normalize_posix_path
+from .file_utils import normalize_posix_path, resolve_repo_cache_root
 from .js_parser import build_js_semantic_map
 from .lint_collector import iter_target_batches, ruff_severity
 from .models import FileInfo, LintIssue, RepoInfo, SemanticMap
@@ -54,18 +54,7 @@ class CodeInsightEngine:
         self.manifest_path = self._cache_root / "manifest.json"
 
     def _resolve_cache_root(self) -> Path:
-        env = os.environ.get("PIXREP_CACHE_DIR", "").strip()
-        if env:
-            return Path(env).expanduser().resolve() / self.repo.name
-
-        if os.name == "nt":
-            base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-            return base / "pixrep" / "cache" / self.repo.name
-
-        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
-        if xdg:
-            return Path(xdg).expanduser().resolve() / "pixrep" / self.repo.name
-        return Path.home() / ".cache" / "pixrep" / self.repo.name
+        return resolve_repo_cache_root(self.repo.root)
 
     def enrich_repo(self) -> None:
         """Populate semantic maps and lint issues onto every repo file."""
