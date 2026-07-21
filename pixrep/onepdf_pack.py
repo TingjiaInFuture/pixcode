@@ -220,18 +220,19 @@ def pack_repo_to_one_pdf(
         emit(header)
         emit("-" * min(max_cols, max(10, len(header))))
         try:
-            file_text = f.abs_path.read_text(encoding="utf-8", errors="replace")
+            src = f.abs_path.open("r", encoding="utf-8", errors="replace")
         except OSError:
             emit("(read failed)")
             emit("")
             continue
-        for raw_line in file_text.split("\n"):
-            safe_line = _ascii_safe(raw_line.rstrip())
-            if wrap:
-                for chunk in _wrap_line(safe_line, max_cols):
-                    emit(chunk)
-            else:
-                emit(safe_line)
+        with src:
+            for raw_line in src:
+                safe_line = _ascii_safe(raw_line.rstrip())
+                if wrap:
+                    for chunk in _wrap_line(safe_line, max_cols):
+                        emit(chunk)
+                else:
+                    emit(safe_line)
         emit("")
 
     flush_page()
