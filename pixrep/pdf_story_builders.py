@@ -250,7 +250,13 @@ def build_file_story(gen, file_info: FileInfo) -> list:
             line_heat=line_heat,
         )
     else:
-        all_lines = file_info.load_content().split("\n")
+        # Read once from disk without back-filling the lazy content cache; the
+        # semantic step already released any cached content (P0-4).
+        try:
+            raw = file_info.abs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raw = "(read failed)"
+        all_lines = raw.split("\n")
         gen._add_code_chunks(story, all_lines, file_info.language, cw,
                              first_avail=first_avail,
                              later_avail=later_avail,

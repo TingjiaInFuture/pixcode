@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 
 def xml_escape(text: str) -> str:
@@ -62,68 +63,118 @@ def truncate_to_width(text: str, font_size: float, max_width: float) -> str:
     return text
 
 
-def pdf_bytes_to_long_png(pdf_bytes: bytes, dpi: int = 150, max_total_pixels: int = 120_000_000) -> bytes:
-    """将 PDF 字节流渲染为单张垂直拼接长图的 PNG 字节流。
+def _encode_png(image, optimize: bool) -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", optimize=optimize)
+    return buf.getvalue()
+
+
+def _group_pages(
+    page_wh: list[tuple[int, int]],
+    max_total_pixels: int,
+    split: bool,
+) -> list[tuple[list[int], list[tuple[int, int]]]]:
+    """Partition pages into canvas groups. A single group unless ``split``."""
+    n = len(page_wh)
+    if n == 0:
+        return []
+    if not split:
+        return [(list(range(n)), list(page_wh))]
+    max_w_all = max(w for w, _ in page_wh)
+    max_rows_per_group = max(1, int(max_total_pixels / max(1, max_w_all)))
+    groups: list[tuple[list[int], list[tuple[int, int]]]] = []
+    cur_idx: list[int] = []
+    cur_wh: list[tuple[int, int]] = []
+    cur_rows = 0
+    for i, (w, h) in enumerate(page_wh):
+        if cur_wh and cur_rows + h > max_rows_per_group:
+            groups.append((cur_idx, cur_wh))
+            cur_idx, cur_wh, cur_rows = [], [], 0
+        cur_idx.append(i)
+        cur_wh.append((w, h))
+        cur_rows += h
+    if cur_wh:
+        groups.append((cur_idx, cur_wh))
+    return groups
+
+
+def pdf_to_long_png(
+    pdf_source,
+    *,
+    dpi: int = 150,
+    max_total_pixels: int = 120_000_000,
+    optimize: bool = False,
+    split: bool = False,
+) -> dict[str, bytes]:
+    """将 PDF 渲染为 PNG 长图，返回 {stem: png_bytes}。
+
+    Pre-computes the render scale from page rects **before** rendering (P0-3):
+    full-resolution pages are never materialised in memory, and each rendered
+    page is pasted onto the canvas and closed immediately. When ``split`` is
+    True and a single stitched canvas would exceed the pixel budget, pages are
+    grouped into multiple images ("0001", "0002", ...).
 
     Parameters
     ----------
-    pdf_bytes : bytes
-        完整的 PDF 文件内容（内存中）。
+    pdf_source : bytes | Path
+        PDF 内容（内存字节）或 PDF 文件路径。传路径可避免在内存中保留
+        完整 PDF 字节副本。
     dpi : int
-        渲染分辨率，默认 150。越高越清晰但文件越大。
-
-    Returns
-    -------
-    bytes
-        PNG 格式的图片字节流。
+        目标渲染分辨率（在不超过像素预算的前提下）。
+    max_total_pixels : int
+        单张长图的最大像素总数；超限时整体缩小。
+    optimize : bool
+        是否开启 Pillow PNG 优化（默认关闭以省 CPU）。
+    split : bool
+        超像素预算时是否输出多张分页 PNG（默认 False，仅缩小）。
     """
-    import fitz
-    from PIL import Image
     import io
 
-    Image.MAX_IMAGE_PIXELS = None
+    import fitz
+    from PIL import Image
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    images: list[Image.Image] = []
-    total_height = 0
-    max_width = 0
-    total_pixels = 0
-
-    for page in doc:
-        pix = page.get_pixmap(dpi=dpi)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        images.append(img)
-        total_height += pix.height
-        max_width = max(max_width, pix.width)
-        total_pixels += pix.width * pix.height
-
-    doc.close()
-
-    if total_pixels > max_total_pixels and total_pixels > 0:
-        scale = (max_total_pixels / total_pixels) ** 0.5
-        resized: list[Image.Image] = []
-        total_height = 0
-        max_width = 0
-        for img in images:
-            new_w = max(1, int(img.width * scale))
-            new_h = max(1, int(img.height * scale))
-            shrunk = img.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
-            resized.append(shrunk)
-            total_height += new_h
-            max_width = max(max_width, new_w)
-            img.close()
-        images = resized
-
-    if not images:
-        canvas = Image.new("RGB", (1, 1), color="white")
+    if isinstance(pdf_source, (bytes, bytearray)):
+        doc = fitz.open(stream=bytes(pdf_source), filetype="pdf")
     else:
-        canvas = Image.new("RGB", (max_width, total_height), color="white")
-        y_offset = 0
-        for img in images:
-            canvas.paste(img, (0, y_offset))
-            y_offset += img.height
-            img.close()
+        doc = fitz.open(str(pdf_source), filetype="pdf")
 
-    out_buf = io.BytesIO()
-    canvas.save(out_buf, format="PNG", optimize=True)
-    return out_buf.getvalue()
+    try:
+        page_count = doc.page_count
+        if page_count == 0:
+            return {"image": _encode_png(Image.new("RGB", (1, 1), color="white"), optimize)}
+
+        base_scale = dpi / 72.0
+        page_rects = [doc[i].rect for i in range(page_count)]
+        # Estimated total pixels at the requested DPI, before any rendering.
+        estimated = sum(r.width * r.height for r in page_rects) * base_scale * base_scale
+        scale = base_scale
+        if estimated > max_total_pixels and estimated > 0:
+            scale = base_scale * (max_total_pixels / estimated) ** 0.5
+
+        matrix = fitz.Matrix(scale, scale)
+        page_wh = [
+            (max(1, int(r.width * scale)), max(1, int(r.height * scale)))
+            for r in page_rects
+        ]
+
+        groups = _group_pages(page_wh, max_total_pixels, split)
+        result: dict[str, bytes] = {}
+        for gi, (indices, gwh) in enumerate(groups):
+            group_width = max(w for w, _ in gwh)
+            group_height = sum(h for _, h in gwh)
+            canvas = Image.new("RGB", (group_width, group_height), color="white")
+            y = 0
+            for idx, (_w, h) in zip(indices, gwh):
+                pix = doc[idx].get_pixmap(matrix=matrix)
+                page_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                canvas.paste(page_img, (0, y))
+                y += h
+                page_img.close()
+            stem = "image" if len(groups) == 1 else f"{gi + 1:04d}"
+            result[stem] = _encode_png(canvas, optimize)
+            canvas.close()
+        return result
+    finally:
+        doc.close()

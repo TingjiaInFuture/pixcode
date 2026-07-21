@@ -86,7 +86,12 @@ class RipgrepSearcher:
         case_sensitive: bool = False,
         context_lines: int = 0,
     ) -> list[MatchLocation]:
-        """Run ripgrep and return structured match locations."""
+        """Run ripgrep and return structured match locations.
+
+        Streams rg's JSON output line by line and stops as soon as
+        ``max_results`` matches are collected, terminating the subprocess
+        instead of buffering its entire output (P0-2).
+        """
         if not self._rg_available:
             log.warning("ripgrep (rg) not found; falling back to basic search")
             return self._fallback_search(
@@ -124,23 +129,87 @@ class RipgrepSearcher:
         cmd.append(str(self.repo_root))
 
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 text=True,
                 cwd=str(self.repo_root),
-                timeout=self.timeout,
-                check=False,
+                bufsize=1,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            log.debug("ripgrep invocation failed or timed out")
+        except OSError:
+            log.debug("ripgrep invocation failed")
             return []
 
-        return self._parse_rg_json(proc.stdout)
+        matches: list[MatchLocation] = []
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                m = self._build_match(msg)
+                if m is not None:
+                    matches.append(m)
+                    if len(matches) >= self.max_results:
+                        proc.terminate()
+                        break
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            self._kill(proc)
+        finally:
+            self._kill(proc)
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+        return matches
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def _build_match(self, msg: dict) -> MatchLocation | None:
+        if msg.get("type") != "match":
+            return None
+        data = msg.get("data", {})
+        path_data = data.get("path", {})
+        path_text = path_data.get("text", "")
+
+        try:
+            abs_p = Path(path_text).resolve()
+            rel = abs_p.relative_to(self.repo_root)
+            rel_posix = normalize_posix_path(rel)
+        except (ValueError, OSError):
+            rel_posix = normalize_posix_path(path_text)
+
+        line_number = int(data.get("line_number", 0))
+        lines_data = data.get("lines", {})
+        line_text = lines_data.get("text", "").rstrip("\n")
+
+        submatches: list[tuple[int, int]] = []
+        for sm in data.get("submatches", []):
+            submatches.append((int(sm.get("start", 0)), int(sm.get("end", 0))))
+
+        return MatchLocation(
+            rel_path=rel_posix,
+            line_number=line_number,
+            line_text=line_text,
+            submatches=submatches,
+        )
 
     def _parse_rg_json(self, output: str) -> list[MatchLocation]:
+        """Parse already-buffered rg JSON output (kept for tests/fallback)."""
         matches: list[MatchLocation] = []
-
         for line in output.splitlines():
             if not line.strip():
                 continue
@@ -148,40 +217,11 @@ class RipgrepSearcher:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
-
-            if msg.get("type") != "match":
-                continue
-
-            data = msg.get("data", {})
-            path_data = data.get("path", {})
-            path_text = path_data.get("text", "")
-
-            try:
-                abs_p = Path(path_text).resolve()
-                rel = abs_p.relative_to(self.repo_root)
-                rel_posix = normalize_posix_path(rel)
-            except (ValueError, OSError):
-                rel_posix = normalize_posix_path(path_text)
-
-            line_number = int(data.get("line_number", 0))
-            lines_data = data.get("lines", {})
-            line_text = lines_data.get("text", "").rstrip("\n")
-
-            submatches: list[tuple[int, int]] = []
-            for sm in data.get("submatches", []):
-                submatches.append((int(sm.get("start", 0)), int(sm.get("end", 0))))
-
-            matches.append(
-                MatchLocation(
-                    rel_path=rel_posix,
-                    line_number=line_number,
-                    line_text=line_text,
-                    submatches=submatches,
-                )
-            )
-            if len(matches) >= self.max_results:
-                break
-
+            m = self._build_match(msg)
+            if m is not None:
+                matches.append(m)
+                if len(matches) >= self.max_results:
+                    break
         return matches
 
     def _fallback_search(

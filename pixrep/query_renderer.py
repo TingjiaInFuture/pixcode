@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 from datetime import datetime
 from pathlib import Path
 
@@ -60,20 +59,34 @@ class QueryResultRenderer:
             doc.build(story, onFirstPage=self._footer, onLaterPages=self._footer)
             return
 
-        from .utils import pdf_bytes_to_long_png
+        import tempfile
+        from .utils import pdf_to_long_png
 
-        buf = io.BytesIO()
-        doc = SimpleDocTemplate(
-            buf,
-            pagesize=A4,
-            leftMargin=self.margin,
-            rightMargin=self.margin,
-            topMargin=self.margin,
-            bottomMargin=15 * mm,
-        )
-        doc.build(story, onFirstPage=self._footer, onLaterPages=self._footer)
-        png_bytes = pdf_bytes_to_long_png(buf.getvalue(), dpi=self.png_dpi)
-        self.output_path.write_bytes(png_bytes)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            doc = SimpleDocTemplate(
+                str(tmp_path),
+                pagesize=A4,
+                leftMargin=self.margin,
+                rightMargin=self.margin,
+                topMargin=self.margin,
+                bottomMargin=15 * mm,
+            )
+            doc.build(story, onFirstPage=self._footer, onLaterPages=self._footer)
+            images = pdf_to_long_png(tmp_path, dpi=self.png_dpi)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if len(images) == 1:
+            self.output_path.write_bytes(next(iter(images.values())))
+        else:
+            stem = self.output_path.stem
+            for name, data in images.items():
+                self.output_path.with_name(f"{stem}_{name}.png").write_bytes(data)
 
     def _build_story(self) -> list:
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet

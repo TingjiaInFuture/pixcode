@@ -94,6 +94,23 @@ Examples:
         help="DPI for PNG rendering (default: 150, only used with --format png) / PNG 渲染分辨率",
     )
     generate_parser.add_argument(
+        "--max-total-pixels",
+        type=int,
+        default=120_000_000,
+        metavar="N",
+        help="Max pixels per PNG long image (default: 120000000); scales down when exceeded / 单张 PNG 长图最大像素",
+    )
+    generate_parser.add_argument(
+        "--png-optimize",
+        action="store_true",
+        help="Enable Pillow PNG optimization (slower, smaller) / 开启 PNG 优化",
+    )
+    generate_parser.add_argument(
+        "--png-split",
+        action="store_true",
+        help="Split oversized PNGs into multiple images / 超像素时输出多张分页 PNG",
+    )
+    generate_parser.add_argument(
         "--index-only", action="store_true",
         help="Generate only 00_INDEX.pdf / 仅生成索引 PDF",
     )
@@ -426,6 +443,9 @@ def _run_generate(args: argparse.Namespace) -> int:
         max_workers=args.workers,
         output_format=args.format,
         png_dpi=args.png_dpi,
+        max_total_pixels=args.max_total_pixels,
+        png_optimize=args.png_optimize,
+        png_split=args.png_split,
     )
     if args.index_only:
         generator.generate_index_only()
@@ -488,11 +508,18 @@ def _run_query(args: argparse.Namespace) -> int:
     from .query_renderer import QueryResultRenderer
     from .query_tui import QueryPreviewTUI
 
-    repo, code = _scan_repo(args, include_content=False)
-    if code != 0 or repo is None or not repo.files:
-        return code
+    repo_root = Path(args.repo).resolve()
+    if not repo_root.is_dir():
+        log.error("Error: '%s' is not a directory", args.repo)
+        return 1
 
+    # Semantic search needs the full Python file set to build its symbol
+    # index, so it still scans the repo. Text search goes ripgrep-first and
+    # only scans the hit files afterwards (P0-2).
     if args.semantic:
+        repo, code = _scan_repo(args, include_content=False)
+        if code != 0 or repo is None or not repo.files:
+            return code
         semantic_searcher = SemanticSearcher(repo=repo, max_results=args.max_results)
         matches = semantic_searcher.search(
             args.query,
@@ -500,9 +527,15 @@ def _run_query(args: argparse.Namespace) -> int:
             case_sensitive=args.case_sensitive,
             file_globs=args.glob or None,
         )
+        if not matches:
+            log.info("No matches found for: %s", args.query)
+            return 0
+        scanned_paths = {normalize_posix_path(info.path) for info in repo.files}
+        matches = [m for m in matches if m.rel_path in scanned_paths]
+        repo_name = repo.name
     else:
         searcher = RipgrepSearcher(
-            repo_root=repo.root,
+            repo_root=repo_root,
             max_results=args.max_results,
         )
         if not searcher.available:
@@ -517,19 +550,32 @@ def _run_query(args: argparse.Namespace) -> int:
             fixed_strings=args.fixed,
             case_sensitive=args.case_sensitive,
         )
-
-    if not matches:
-        log.info("No matches found for: %s", args.query)
-        return 0
-
-    scanned_paths = {normalize_posix_path(info.path) for info in repo.files}
-    matches = [m for m in matches if m.rel_path in scanned_paths]
-    if not matches:
-        log.info(
-            "Matches were found only in files excluded by scanner. "
-            "Try adjusting --ignore/--glob options."
+        if not matches:
+            log.info("No matches found for: %s", args.query)
+            return 0
+        # Scan only the hit files: applies pixrep ignore rules + line counts
+        # without walking the whole repo.
+        hit_rel = sorted({m.rel_path for m in matches})
+        scanner = RepoScanner(
+            str(repo_root),
+            max_file_size=args.max_size * 1024,
+            extra_ignore=args.ignore,
         )
-        return 0
+        hit_files = scanner.scan_files(
+            [repo_root / rel for rel in hit_rel],
+            include_content=False,
+        )
+        scanned_rel = {normalize_posix_path(f.path) for f in hit_files}
+        matches = [m for m in matches if m.rel_path in scanned_rel]
+        if not matches:
+            log.info(
+                "Matches were found only in files excluded by scanner. "
+                "Try adjusting --ignore/--glob options."
+            )
+            return 0
+        repo = RepoInfo(root=repo_root, name=repo_root.name, files=hit_files)
+        repo.total_lines = sum(f.line_count for f in hit_files)
+        repo_name = repo_root.name
 
     log.info("Found %d matches", len(matches))
 
@@ -562,7 +608,7 @@ def _run_query(args: argparse.Namespace) -> int:
     else:
         safe_q = args.query[:30].replace("/", "_").replace("\\", "_")
         safe_q = re.sub(r"[^\w\-_.]", "_", safe_q)
-        out_path = Path(f"./pixrep_output/{repo.name}/QUERY_{safe_q}.{args.format}")
+        out_path = Path(f"./pixrep_output/{repo_name}/QUERY_{safe_q}.{args.format}")
 
     renderer = QueryResultRenderer(
         repo=repo,

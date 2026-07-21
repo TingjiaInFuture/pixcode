@@ -290,12 +290,20 @@ class CodeInsightEngine:
         return result
 
     def _build_semantic_map(self, info: FileInfo) -> SemanticMap:
+        # Text-like languages yield no semantic map; skip reading content for
+        # them so cold-start analysis does not cache the whole repo's text (P0-4).
+        if info.language in {"text", "json", "yaml", "toml", "markdown", "ini"}:
+            return SemanticMap(kind="none", lines=[])
         content = info.load_content()
-        if info.language == "python":
-            return self._python_semantic_map(content)
-        if info.language in {"javascript", "typescript"}:
-            return self._js_semantic_map(content)
-        return self._generic_semantic_map(content, info.language)
+        try:
+            if info.language == "python":
+                return self._python_semantic_map(content)
+            if info.language in {"javascript", "typescript"}:
+                return self._js_semantic_map(content)
+            return self._generic_semantic_map(content, info.language)
+        finally:
+            # Drop the in-memory text immediately; rendering re-reads from disk.
+            info.release_content()
 
     def _build_semantic_map_cached(self, info: FileInfo) -> SemanticMap:
         cache_key = self._semantic_cache_key(info)

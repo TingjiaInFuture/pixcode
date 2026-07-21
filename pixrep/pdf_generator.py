@@ -1,7 +1,7 @@
 import hashlib
-import io
 import logging
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +23,7 @@ from .manifest import BuildManifest, FileEntry, compute_options_hash
 from .models import FileInfo, RepoInfo
 from .pdf_story_builders import build_file_story, build_index_story
 from .theme import COLORS
-from .utils import xml_escape
+from .utils import pdf_to_long_png, xml_escape
 from .version import __version__
 
 
@@ -39,7 +39,10 @@ class PDFGenerator:
                  incremental: bool = False,
                  max_workers: int | None = None,
                  output_format: str = "pdf",
-                 png_dpi: int = 150):
+                 png_dpi: int = 150,
+                 max_total_pixels: int = 120_000_000,
+                 png_optimize: bool = False,
+                 png_split: bool = False):
         self.repo = repo
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -51,10 +54,18 @@ class PDFGenerator:
         self.enable_semantic_minimap = enable_semantic_minimap
         self.enable_lint_heatmap = enable_lint_heatmap
         self.incremental = incremental
-        # None → use CPU count, capped at 8 to avoid over-subscription.
-        self.max_workers = max_workers if max_workers is not None else min(8, os.cpu_count() or 1)
+        # None → PDF: CPU count capped at 8; PNG: capped at 2 (memory-heavy).
+        if max_workers is not None:
+            self.max_workers = max_workers
+        elif output_format == "png":
+            self.max_workers = min(2, os.cpu_count() or 1)
+        else:
+            self.max_workers = min(8, os.cpu_count() or 1)
         self.output_format = output_format
         self.png_dpi = png_dpi
+        self.max_total_pixels = max_total_pixels
+        self.png_optimize = png_optimize
+        self.png_split = png_split
         self.streaming_file_threshold = 256 * 1024
         # Fingerprint the rendering/cache options so that changing theme, font,
         # DPI, format, semantic/lint toggles, linter version/config or pixrep
@@ -224,25 +235,42 @@ class PDFGenerator:
     def _build_and_save(self, story: list, out_path: Path) -> None:
         """构建 PDF 并根据 output_format 保存为 PDF 或 PNG。
 
-        当 output_format == 'pdf' 时直接写入磁盘。
-        当 output_format == 'png' 时先在内存中生成 PDF，再转为长图 PNG 写入磁盘。
+        PDF 直接写盘。PNG 先把 PDF 写入临时文件再渲染（避免在内存中保留
+        完整 PDF 字节副本），并在渲染前预缩放以限制峰值内存（P0-3）。
         """
         if self.output_format == "pdf":
             doc = self._make_doc(out_path)
             doc.build(story,
                       onFirstPage=self._page_footer,
                       onLaterPages=self._page_footer)
-        else:
-            from .utils import pdf_bytes_to_long_png
+            return
 
-            buf = io.BytesIO()
-            doc = self._make_doc(buf)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            doc = self._make_doc(tmp_path)
             doc.build(story,
                       onFirstPage=self._page_footer,
                       onLaterPages=self._page_footer)
-            pdf_bytes = buf.getvalue()
-            png_bytes = pdf_bytes_to_long_png(pdf_bytes, dpi=self.png_dpi)
-            out_path.write_bytes(png_bytes)
+            images = pdf_to_long_png(
+                tmp_path,
+                dpi=self.png_dpi,
+                max_total_pixels=self.max_total_pixels,
+                optimize=self.png_optimize,
+                split=self.png_split,
+            )
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        if len(images) == 1:
+            out_path.write_bytes(next(iter(images.values())))
+        else:
+            stem = out_path.stem
+            for name, data in images.items():
+                out_path.with_name(f"{stem}_{name}.png").write_bytes(data)
 
     def _cjk_style(self, name, parent_name="Normal", **kwargs):
         styles = getSampleStyleSheet()
