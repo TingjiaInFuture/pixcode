@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import json
@@ -163,6 +164,37 @@ def _wrap_line(line: str, max_cols: int) -> list[str]:
     return result
 
 
+def _strip_python_docstrings(content: str) -> str:
+    """AST-safe removal of Python docstrings (module/class/function).
+
+    Drops only the docstring line ranges; all other code and formatting is
+    preserved verbatim. Falls back to the original text on a syntax error.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return content
+    drop: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            doc = body[0]
+            for ln in range(doc.lineno, (doc.end_lineno or doc.lineno) + 1):
+                drop.add(ln)
+    if not drop:
+        return content
+    return "".join(
+        line for i, line in enumerate(content.splitlines(keepends=True), 1) if i not in drop
+    )
+
+
 class _BlockCache:
     """Per-file cache of normalised ONEPDF blocks (ONEPDF v2).
 
@@ -202,32 +234,48 @@ def _normalize_block(
     max_cols: int,
     compact: bool,
     wrap: bool,
+    strip_docs: bool = False,
     block_cache: _BlockCache | None = None,
 ) -> list[str]:
-    opts_sig = f"{tab_size}|{max_cols}|{int(compact)}|{int(wrap)}"
+    opts_sig = f"{tab_size}|{max_cols}|{int(compact)}|{int(wrap)}|{int(strip_docs)}"
     if block_cache is not None:
         cached = block_cache.load(f.git_blob, opts_sig)
         if cached is not None:
             return cached
+    # Source lines: full text (+ AST docstring strip) for semantic Python,
+    # otherwise stream straight from disk.
+    if strip_docs and f.language == "python":
+        try:
+            text = _strip_python_docstrings(
+                f.abs_path.read_text(encoding="utf-8", errors="replace")
+            )
+        except OSError:
+            return ["(read failed)"]
+        raw_iter: object = iter(text.split("\n"))
+    else:
+        try:
+            raw_iter = f.abs_path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            return ["(read failed)"]
     lines: list[str] = []
     try:
-        with f.abs_path.open("r", encoding="utf-8", errors="replace") as src:
-            prev_blank = False
-            for raw_line in src:
-                line = raw_line.rstrip("\n")
-                if compact:
-                    line = line.rstrip()
-                    is_blank = not line
-                    if is_blank and prev_blank:
-                        continue
-                    prev_blank = is_blank
-                safe_line = _ascii_safe(line, tab_size)
-                if wrap:
-                    lines.extend(_wrap_line(safe_line, max_cols))
-                else:
-                    lines.append(safe_line)
-    except OSError:
-        lines = ["(read failed)"]
+        prev_blank = False
+        for raw_line in raw_iter:  # type: ignore[union-attr]
+            line = raw_line.rstrip("\n")
+            if compact:
+                line = line.rstrip()
+                is_blank = not line
+                if is_blank and prev_blank:
+                    continue
+                prev_blank = is_blank
+            safe_line = _ascii_safe(line, tab_size)
+            if wrap:
+                lines.extend(_wrap_line(safe_line, max_cols))
+            else:
+                lines.append(safe_line)
+    finally:
+        if hasattr(raw_iter, "close"):
+            raw_iter.close()  # type: ignore[union-attr]
     if block_cache is not None:
         block_cache.save(f.git_blob, opts_sig, lines)
     return lines
@@ -298,7 +346,8 @@ def pack_repo_to_one_pdf(
     )
     files.sort(key=_importance_key if order == "importance" else lambda x: (x.rel_posix,))
 
-    compact = profile == "compact"
+    compact = profile in {"compact", "semantic"}
+    strip_docs = profile == "semantic"
 
     font_size = 7
     leading = 9
@@ -363,7 +412,7 @@ def pack_repo_to_one_pdf(
             )
             emit(header)
             emit("-" * min(max_cols, max(10, len(header))))
-        for line in _normalize_block(f, tab_size, max_cols, compact, wrap, block_cache):
+        for line in _normalize_block(f, tab_size, max_cols, compact, wrap, strip_docs, block_cache):
             emit(line)
         emit("")
 

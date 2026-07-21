@@ -326,7 +326,7 @@ Examples:
         )
         p.add_argument(
             "--profile",
-            choices=["compact", "lossless"],
+            choices=["compact", "lossless", "semantic"],
             default="compact",
             help="Content profile (default: compact) / 内容压缩档",
         )
