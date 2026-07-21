@@ -87,3 +87,13 @@ def register_fonts() -> FontRegistry:
         mono="Courier",
         mono_bold="Courier-Bold",
     )
+
+
+# Built-in PDF fonts (no CJK embedding). Used for ASCII-only files so their
+# PDFs stay small (P1-6).
+COURIER_FALLBACK = FontRegistry(
+    normal="Helvetica",
+    bold="Helvetica-Bold",
+    mono="Courier",
+    mono_bold="Courier-Bold",
+)

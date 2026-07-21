@@ -5,7 +5,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus.flowables import Flowable
 
-from .fonts import FontRegistry
+from .fonts import COURIER_FALLBACK, FontRegistry
 from .models import SemanticMap
 from .syntax import BUILTIN_FUNCTIONS, COMMENT_STYLES, KEYWORDS
 from .theme import COLORS
@@ -75,6 +75,7 @@ class CodeBlockChunk(Flowable):
                  start_line: int = 1, width: float | None = None,
                  font_size: float = 6.5,
                  line_heat: dict[int, str] | None = None,
+                 syntax: str = "full",
                  _precomputed_mask: list[bool] | None = None):
         super().__init__()
         self.code_lines = lines
@@ -84,8 +85,12 @@ class CodeBlockChunk(Flowable):
         self.font_size = font_size
         self.line_height = font_size * 1.6
         self.padding = 6
-        self.fonts = fonts
         self.line_heat = line_heat or {}
+        self._syntax = syntax
+        # ASCII-only files use built-in Courier so their PDFs do not embed the
+        # CJK font (P1-6). Files with any non-ASCII byte keep the CJK registry.
+        ascii_only = all(line.isascii() for line in lines)
+        self.fonts = COURIER_FALLBACK if ascii_only else fonts
 
         self.kw_set = KEYWORDS.get(language, set())
         self.builtin_set = BUILTIN_FUNCTIONS.get(language, set())
@@ -157,6 +162,7 @@ class CodeBlockChunk(Flowable):
             width=self.block_width,
             font_size=self.font_size,
             line_heat=self.line_heat,
+            syntax=self._syntax,
             _precomputed_mask=self._ml_string_mask[:max_lines],
         )
         second_chunk = CodeBlockChunk(
@@ -167,6 +173,7 @@ class CodeBlockChunk(Flowable):
             width=self.block_width,
             font_size=self.font_size,
             line_heat=self.line_heat,
+            syntax=self._syntax,
             _precomputed_mask=self._ml_string_mask[max_lines:],
         )
         return [first_chunk, second_chunk]
@@ -229,6 +236,14 @@ class CodeBlockChunk(Flowable):
 
     def _draw_line(self, canv, x, y, line, in_multiline_string: bool = False):
         fs = self.font_size
+
+        if self._syntax == "none":
+            # Fast path: no highlighting, single drawString (--fast / --syntax none).
+            canv.setFont(self.fonts.mono, fs)
+            canv.setFillColor(COLORS["fg"])
+            canv.drawString(x, y, line)
+            return
+
         stripped = line.lstrip()
 
         if in_multiline_string:

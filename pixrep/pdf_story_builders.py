@@ -4,7 +4,7 @@ from datetime import datetime
 
 from reportlab.lib.colors import HexColor, white
 from reportlab.lib.units import mm
-from reportlab.platypus import PageBreak, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import LongTable, PageBreak, Paragraph, Spacer, Table, TableStyle
 
 from .flowables import HeaderBar, LintLegend, SemanticMiniMap, StatBox
 from .models import FileInfo
@@ -141,7 +141,7 @@ def build_index_story(gen) -> list:
         ])
     cols = [cw * 0.06, cw * 0.38, cw * 0.12,
             cw * 0.12, cw * 0.12, cw * 0.20]
-    file_table = Table(data, colWidths=cols, repeatRows=1)
+    file_table = LongTable(data, colWidths=cols, repeatRows=1)
     file_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), COLORS["header_bg"]),
         ("TEXTCOLOR", (0, 0), (-1, 0), white),
@@ -159,7 +159,13 @@ def build_index_story(gen) -> list:
     return story
 
 
-def build_file_story(gen, file_info: FileInfo) -> list:
+def build_file_preamble(gen, file_info: FileInfo):
+    """Build the header/meta/semantic/legend block and compute remaining page
+    heights. Shared by the Platypus path (build_file_story) and the direct
+    canvas path (DirectCodeRenderer) so both render identical headers (P1-5).
+
+    Returns (flowables, first_avail, later_avail, line_heat).
+    """
     story = []
     cw = gen.content_width
 
@@ -239,6 +245,12 @@ def build_file_story(gen, file_info: FileInfo) -> list:
     later_avail = gen.avail_height - 10
 
     line_heat = gen._line_heat_map(file_info) if gen.enable_lint_heatmap else {}
+    return story, first_avail, later_avail, line_heat
+
+
+def build_file_story(gen, file_info: FileInfo) -> list:
+    story, first_avail, later_avail, line_heat = build_file_preamble(gen, file_info)
+    cw = gen.content_width
     if file_info.size >= gen.streaming_file_threshold:
         gen._add_code_chunks_streaming(
             story,

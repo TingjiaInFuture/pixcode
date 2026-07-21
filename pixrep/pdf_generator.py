@@ -21,7 +21,7 @@ from .flowables import CodeBlockChunk
 from .fonts import FontRegistry, register_fonts
 from .manifest import BuildManifest, FileEntry, compute_options_hash
 from .models import FileInfo, RepoInfo
-from .pdf_story_builders import build_file_story, build_index_story
+from .pdf_story_builders import build_file_preamble, build_file_story, build_index_story
 from .theme import COLORS
 from .utils import pdf_to_long_png, xml_escape
 from .version import __version__
@@ -42,7 +42,8 @@ class PDFGenerator:
                  png_dpi: int = 150,
                  max_total_pixels: int = 120_000_000,
                  png_optimize: bool = False,
-                 png_split: bool = False):
+                 png_split: bool = False,
+                 syntax_mode: str = "full"):
         self.repo = repo
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -66,6 +67,7 @@ class PDFGenerator:
         self.max_total_pixels = max_total_pixels
         self.png_optimize = png_optimize
         self.png_split = png_split
+        self.syntax_mode = syntax_mode
         self.streaming_file_threshold = 256 * 1024
         # Fingerprint the rendering/cache options so that changing theme, font,
         # DPI, format, semantic/lint toggles, linter version/config or pixrep
@@ -77,7 +79,7 @@ class PDFGenerator:
             output_format=output_format,
             enable_semantic=enable_semantic_minimap,
             enable_lint=enable_lint_heatmap,
-            syntax_mode="full",
+            syntax_mode=syntax_mode,
             repo_root=self.repo.root,
         )
         self.insight_engine = CodeInsightEngine(
@@ -299,8 +301,13 @@ class PDFGenerator:
         """生成单个源文件的输出（PDF 或 PNG）。"""
         out_name = self._file_out_name(file_info)
         out_path = self.output_dir / out_name
-        story = self._build_file_story(file_info)
-        self._build_and_save(story, out_path)
+        if self.output_format == "pdf" and file_info.size >= self.streaming_file_threshold:
+            # Large files: render directly on a canvas without holding the full
+            # Platypus story in memory (P1-5).
+            self._render_file_direct(file_info, out_path)
+        else:
+            story = self._build_file_story(file_info)
+            self._build_and_save(story, out_path)
         file_info.release_content()
         log.info("  %s (%d lines)", out_name, file_info.line_count)
 
@@ -323,6 +330,7 @@ class PDFGenerator:
                 start_line=offset + 1,
                 width=width, font_size=font_size,
                 line_heat=line_heat,
+                syntax=self.syntax_mode,
             ))
 
             offset += n
@@ -360,6 +368,7 @@ class PDFGenerator:
                         start_line=line_no,
                         width=width, font_size=font_size,
                         line_heat=line_heat,
+                        syntax=self.syntax_mode,
                     ))
 
                     line_no += len(chunk)
@@ -377,7 +386,95 @@ class PDFGenerator:
                 start_line=1,
                 width=width, font_size=font_size,
                 line_heat=line_heat,
+                syntax=self.syntax_mode,
             ))
+
+    def iter_code_chunks(self, file_info: FileInfo, width: float,
+                         first_avail: float, later_avail: float,
+                         font_size: float = 6.5,
+                         line_heat: dict[int, str] | None = None):
+        """Yield (CodeBlockChunk, full_page) for a file without building a
+        Platypus story (P1-5). Streams large files from disk."""
+        if file_info.size >= self.streaming_file_threshold:
+            yield from self._iter_streaming(
+                file_info.abs_path, file_info.language, width,
+                first_avail, later_avail, font_size, line_heat,
+            )
+            return
+        try:
+            raw = file_info.abs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raw = "(read failed)"
+        all_lines = raw.split("\n")
+        offset = 0
+        first = True
+        while offset < len(all_lines):
+            avail = first_avail if first else later_avail
+            n = self._max_lines_for_height(avail, font_size)
+            chunk_lines = all_lines[offset:offset + n]
+            yield (
+                CodeBlockChunk(
+                    chunk_lines, file_info.language,
+                    fonts=self.fonts,
+                    start_line=offset + 1,
+                    width=width, font_size=font_size,
+                    line_heat=line_heat,
+                    syntax=self.syntax_mode,
+                ),
+                len(chunk_lines) == n,
+            )
+            offset += n
+            first = False
+
+    def _iter_streaming(self, abs_path: Path, language: str, width: float,
+                        first_avail: float, later_avail: float,
+                        font_size: float = 6.5,
+                        line_heat: dict[int, str] | None = None):
+        first_chunk = True
+        line_no = 1
+        try:
+            with abs_path.open("r", encoding="utf-8", errors="replace") as f:
+                while True:
+                    avail = first_avail if first_chunk else later_avail
+                    n = self._max_lines_for_height(avail, font_size)
+                    chunk: list[str] = []
+                    for _ in range(n):
+                        line = f.readline()
+                        if line == "":
+                            break
+                        chunk.append(line.rstrip("\n"))
+                    if not chunk:
+                        break
+                    yield (
+                        CodeBlockChunk(
+                            chunk, language,
+                            fonts=self.fonts,
+                            start_line=line_no,
+                            width=width, font_size=font_size,
+                            line_heat=line_heat,
+                            syntax=self.syntax_mode,
+                        ),
+                        len(chunk) == n,
+                    )
+                    line_no += len(chunk)
+                    first_chunk = False
+        except OSError:
+            yield (
+                CodeBlockChunk(
+                    ["(read failed)"], language,
+                    fonts=self.fonts,
+                    start_line=1,
+                    width=width, font_size=font_size,
+                    line_heat=line_heat,
+                    syntax=self.syntax_mode,
+                ),
+                False,
+            )
+
+    def _render_file_direct(self, file_info: FileInfo, out_path: Path) -> None:
+        """Render a file PDF directly on a canvas, page by page, without
+        building the full Platypus story in memory (P1-5)."""
+        DirectCodeRenderer(self).render(file_info, out_path)
 
     @staticmethod
     def _line_heat_map(info: FileInfo) -> dict[int, str]:
@@ -407,3 +504,65 @@ class PDFGenerator:
         if size < 1024 * 1024:
             return f"{size / 1024:.1f} KB"
         return f"{size / 1024 / 1024:.1f} MB"
+
+
+class DirectCodeRenderer:
+    """Render a single file's PDF directly on a canvas, page by page, without
+    holding the full Platypus story in memory (P1-5). Used for large files.
+    """
+
+    def __init__(self, gen: "PDFGenerator"):
+        self.gen = gen
+
+    def render(self, file_info: FileInfo, out_path: Path) -> None:
+        from reportlab.pdfgen.canvas import Canvas
+
+        gen = self.gen
+        page_width, page_height = A4
+        margin = gen.margin
+        width = gen.content_width
+        bottom = 15 * mm
+        top = page_height - margin
+
+        preamble, first_avail, later_avail, line_heat = build_file_preamble(gen, file_info)
+
+        canvas = Canvas(str(out_path), pagesize=A4)
+        page_no = 1
+        y = top
+
+        def footer():
+            canvas.saveState()
+            canvas.setFont(gen.fonts.normal, 7)
+            canvas.setFillColor(HexColor("#999999"))
+            canvas.drawString(margin, 10 * mm, f"pixrep · {gen.repo.name}")
+            canvas.drawRightString(page_width - margin, 10 * mm, f"Page {page_no}")
+            canvas.restoreState()
+
+        def new_page():
+            nonlocal page_no, y
+            footer()
+            canvas.showPage()
+            page_no += 1
+            y = top
+
+        def place(flowable, gap: float = 0.0):
+            nonlocal y
+            avail = max(1.0, y - bottom)
+            _fw, fh = flowable.wrap(width, avail)
+            if fh > avail and y < top:
+                new_page()
+                avail = max(1.0, y - bottom)
+                _fw, fh = flowable.wrap(width, avail)
+            flowable.drawOn(canvas, margin, y - fh)
+            y -= fh + gap
+
+        for flowable in preamble:
+            place(flowable)
+
+        for chunk, _full in gen.iter_code_chunks(
+            file_info, width, first_avail, later_avail, line_heat=line_heat
+        ):
+            place(chunk, gap=1)
+
+        footer()
+        canvas.save()

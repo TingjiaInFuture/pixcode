@@ -144,6 +144,17 @@ Examples:
         help="Parallel worker threads for PDF generation (default: CPU count, max 8) / PDF 生成并行线程数",
     )
     generate_parser.add_argument(
+        "--syntax",
+        choices=["full", "none"],
+        default="full",
+        help="Syntax highlighting mode: full or none (default: full) / 语法高亮模式",
+    )
+    generate_parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Shortcut for --syntax none (faster, smaller PDFs) / 等价 --syntax none",
+    )
+    generate_parser.add_argument(
         "--list-only", action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -446,6 +457,7 @@ def _run_generate(args: argparse.Namespace) -> int:
         max_total_pixels=args.max_total_pixels,
         png_optimize=args.png_optimize,
         png_split=args.png_split,
+        syntax_mode=("none" if args.fast else args.syntax),
     )
     if args.index_only:
         generator.generate_index_only()
