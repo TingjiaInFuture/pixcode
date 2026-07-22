@@ -99,3 +99,7 @@ RENDER_SCHEMA_VERSION = 2
 LINT_CACHE_SCHEMA_VERSION = 2
 ONEPDF_BLOCK_SCHEMA_VERSION = 2
 SNAPSHOT_SCHEMA_VERSION = 1
+# Symbol/imports caches: bump when the extraction algorithm changes so stale
+# cached entries are treated as misses after an upgrade.
+QUERY_SYMBOL_CACHE_SCHEMA_VERSION = 1
+IMPORTS_CACHE_SCHEMA_VERSION = 1

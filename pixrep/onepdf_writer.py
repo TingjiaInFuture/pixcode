@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 
@@ -42,7 +43,10 @@ class StreamingPDFWriter:
         # A real CJK font is registered (vs the built-in Courier fallback).
         self._cjk_active = self._fonts.mono not in {"Courier"}
         self._deterministic = deterministic
-        self._tmp_path = out_path.with_name(out_path.name + ".tmp")
+        # Unique temp name (PID-suffixed) so two concurrent pixrep runs over
+        # the same output path don't clobber each other's temp file before the
+        # atomic replace.
+        self._tmp_path = out_path.parent / f".{out_path.name}.{os.getpid()}.tmp"
         # invariant=1 makes reportlab emit fixed timestamps / doc-id so two
         # runs over identical input produce byte-identical output.
         self._canvas = canvas.Canvas(
@@ -90,9 +94,6 @@ class StreamingPDFWriter:
         self._canvas.save()
         # fsync the temp file then atomically replace the destination, so the
         # output is either fully old or fully new — never half-written.
-        try:
-            with open(self._tmp_path, "rb") as f:
-                os.fsync(f.fileno())
-        except OSError:
-            pass
+        with contextlib.suppress(OSError), open(self._tmp_path, "rb") as f:
+            os.fsync(f.fileno())
         os.replace(self._tmp_path, self.out_path)

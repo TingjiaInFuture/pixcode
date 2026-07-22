@@ -18,15 +18,23 @@ import tempfile
 import time
 from pathlib import Path
 
-# Benchmark the source tree under test, not a stale installed copy of pixrep
-# that may live in site-packages (which would shadow the working tree).
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+SOURCE_ROOT = str(Path(__file__).resolve().parents[1])
+# Make in-process imports (the incremental test) resolve to the source tree,
+# not a stale installed copy in site-packages.
+sys.path.insert(0, SOURCE_ROOT)
 
 
 def _run(cmd: list[str], cache_dir: str) -> float:
-    env = {**os.environ, "PIXREP_CACHE_DIR": cache_dir}
+    env = {
+        **os.environ,
+        "PIXREP_CACHE_DIR": cache_dir,
+        # A subprocess `python -m pixrep` does NOT inherit the parent sys.path,
+        # so force the source tree onto PYTHONPATH and run it from SOURCE_ROOT,
+        # otherwise we benchmark whatever stale pixrep is installed.
+        "PYTHONPATH": SOURCE_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    }
     t0 = time.perf_counter()
-    subprocess.run(cmd, env=env, check=True, capture_output=True)
+    subprocess.run(cmd, env=env, check=True, capture_output=True, cwd=SOURCE_ROOT)
     return time.perf_counter() - t0
 
 
@@ -66,6 +74,25 @@ def _check_pdf(path: str) -> tuple[bool, str]:
 def main(repo: str) -> int:
     py = sys.executable
     failures: list[str] = []
+
+    # Verify a subprocess resolves pixrep to the source tree, not a stale
+    # installed copy in site-packages — otherwise every measurement below is
+    # meaningless.
+    probe_env = {
+        **os.environ,
+        "PYTHONPATH": SOURCE_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    }
+    probe = subprocess.run(
+        [py, "-c", f"import pixrep; assert {SOURCE_ROOT!r} in pixrep.__file__"],
+        capture_output=True,
+        env=probe_env,
+        cwd=SOURCE_ROOT,
+    )
+    if probe.returncode != 0:
+        print("ERROR: subprocess imports pixrep from outside the source tree:")
+        print(probe.stderr.decode("utf-8", errors="replace"))
+        return 1
+
     with tempfile.TemporaryDirectory() as cache, tempfile.TemporaryDirectory() as out:
         cache_dir, out_dir = str(Path(cache)), str(Path(out))
 

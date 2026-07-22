@@ -3,7 +3,7 @@
 # <img src="https://github.com/user-attachments/assets/2d378b5c-bfd9-4105-a8c2-ce67f8d542fa" width="60" alt="pixrep logo" style="vertical-align: middle;" /> pixrep
 
 
-# 📉 SAVE UP TO 90% TOKENS
+# 📉 SAVE TOKENS WITH VISUAL CONTEXT
 
 ### Turn Codebases into **Visual Context** for Multimodal LLMs
 
@@ -22,7 +22,7 @@
 
 Instead of feeding raw text that consumes massive context windows, **pixrep** converts your repository into a **structured, hierarchical set of PDFs**. This allows you to:
 
-*   **Save 90% Tokens:** Visual encoding is far more efficient than text tokenization.
+*   **Save Tokens:** Visual encoding is far more efficient than text tokenization (~40% fewer tokens in our demonstrated codebase test; results vary by model, repository and rendering settings).
 *   **Test for Free:** Easily share your entire codebase with premium models (like **Claude Opus 4.6**) on platforms like **arena.ai** without hitting text limits.
 
 
@@ -67,7 +67,7 @@ The core philosophy of **pixrep** (rendering code → PDF with syntax highlighti
 *   **🔎 Query Mode:** Search by text or semantic symbols, then render only matched snippets to PDF/PNG.
 *   **🗂️ Hierarchical Output:** Generates a clean `00_INDEX.pdf` summary and separate files for granular access.
 *   **🌏 CJK Support:** Built-in font fallback for Chinese/Japanese/Korean characters (Auto-detects OS fonts).
-*   **🛡️ Smart Filtering:** Respects `.gitignore` patterns and supports custom ignore rules.
+*   **🛡️ Smart Filtering:** In Git repositories, processes only tracked files by default; in plain directories it applies built-in ignore rules plus any `--ignore` globs. (`.gitignore` itself is not parsed; use `--ignore` to add custom rules.)
 *   **📊 Insightful Stats:** Calculates line counts and language distribution automatically.
 *   **🧾 Scan Diagnostics:** Prints scan summary (`seen/loaded/ignored/binary/errors`) for faster troubleshooting.
 
@@ -110,8 +110,8 @@ pixrep generate /path/to/my-project -o ./my-project-pdfs
 pixrep onepdf /path/to/my-project -o ./ONEPDF_CORE.pdf
 ```
 Notes:
-* Defaults to `git ls-files` (tracked files) when available.
-* Defaults to "core-only" filtering (skips docs/tests); use `--no-core-only` to include them.
+* Defaults to `git ls-files` (tracked files) when the target is inside a Git repository (including a subdirectory of a larger monorepo).
+* Defaults to "core-only" filtering (skips docs/tests, **except the root `README.md`**); use `--no-core-only` to include them.
 
 **Preview structure and stats (without generating PDFs):**
 ```bash
@@ -160,12 +160,12 @@ pixrep query . -q "CodeInsight" --semantic --tui
 
 This reduces memory pressure and disk I/O for repository exploration workflows.
 
-Lint/semantic caches are now stored in user cache directories by default:
+Lint/semantic caches are stored in user cache directories by default, namespaced per-repo as `<repo_name>-<resolved_path_sha256[:12]>` so two repos that share a basename never collide:
 
-* Windows: `%LOCALAPPDATA%/pixrep/cache/<repo_name>`
-* Linux/macOS: `$XDG_CACHE_HOME/pixrep/<repo_name>` or `~/.cache/pixrep/<repo_name>`
+* Windows: `%LOCALAPPDATA%/pixrep/cache/<repo_name>-<hash>`
+* Linux/macOS: `$XDG_CACHE_HOME/pixrep/<repo_name>-<hash>` or `~/.cache/pixrep/<repo_name>-<hash>`
 
-You can override with `PIXREP_CACHE_DIR`.
+Override the cache root with `PIXREP_CACHE_DIR`.
 
 ## 📂 Output Structure
 
@@ -173,12 +173,12 @@ After running `pixrep .`, you will get a folder structure optimized for LLM uplo
 
 ```text
 pixrep_output/pixrep/
-├── 00_INDEX.pdf             # <--- Upload this first! Contains tree & stats
-├── 001_LICENSE.pdf
-├── 002_README.md.pdf
-├── 003_pixrep___init__.py.pdf
-├── 005_pixrep_cli.py.pdf
-└── ...
+├── 00_INDEX.pdf                  # <--- Upload this first! Contains tree & stats
+├── LICENSE__a1b2c3d4.pdf
+├── README.md__5e6f7a8b.pdf
+├── pixrep___init__.py__9a0b1c2d.pdf
+├── pixrep_cli.py__3f4e5d6c.pdf
+└── ...                           # names follow <safe_path>__<short_hash>.pdf
 ```
 
 ## 🧩 Supported Languages

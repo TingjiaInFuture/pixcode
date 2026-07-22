@@ -26,15 +26,15 @@ from pixrep.scanner import RepoScanner
 
 class TestGitDirtyParsing(unittest.TestCase):
     def test_parses_spaces_rename_untracked_and_nonascii(self):
-        # porcelain v1 -z: "XY <path>", rename "XY <src>\t<dst>". Paths with
-        # spaces must survive intact (the old `parts[-1]` split dropped them).
-        # Paths are raw UTF-8 bytes so a non-ASCII filename doesn't trip the
+        # porcelain v1 -z: "XY <path>"; rename/copy is TWO NUL fields
+        # "XY <new>\0<old>\0". Paths with spaces must survive intact, and the
+        # old-path field must be skipped (not parsed as a bogus record). Paths
+        # are raw UTF-8 bytes so a non-ASCII filename doesn't trip the
         # platform-default codec (cp936/GBK on Chinese Windows).
         scanner = RepoScanner(".")
-        # "修改意见.txt" as UTF-8 bytes
         nonascii = "修改意见.txt".encode()
         fake = (
-            b" M src/my module.py\0A  added.py\0R  old.py\tnew.py\0"
+            b" M src/my module.py\0A  added.py\0R  new.py\0old.py\0"
             b"?? untracked.py\0?? " + nonascii + b"\0"
         )
         proc = mock.Mock(returncode=0, stdout=fake)

@@ -19,14 +19,16 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .constants import DEFAULT_IGNORE_PATTERNS
+from .constants import DEFAULT_IGNORE_PATTERNS, QUERY_SYMBOL_CACHE_SCHEMA_VERSION
 from .file_utils import (
+    atomic_write_text,
     compile_ignore_matcher,
     normalize_posix_path,
     resolve_repo_cache_root,
     should_ignore_dir,
 )
 from .models import FileInfo, RepoInfo
+from .version import __version__
 
 log = logging.getLogger(__name__)
 
@@ -374,7 +376,11 @@ class SemanticSearcher:
 
     @staticmethod
     def _file_cache_key(rel: str, blob: str) -> str:
-        return hashlib.sha1(f"{rel}|{blob}".encode()).hexdigest()
+        # Fold in the cache schema + pixrep version so an upgrade or a change to
+        # the symbol-extraction algorithm invalidates stale cached entries
+        # instead of being read back as long as the file content is unchanged.
+        raw = f"{QUERY_SYMBOL_CACHE_SCHEMA_VERSION}\0{__version__}\0{rel}\0{blob}"
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     def _build_symbols_for_file(self, info: FileInfo, rel: str) -> list[SymbolEntry]:
         try:
@@ -432,6 +438,11 @@ class SemanticSearcher:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+        if not isinstance(payload, dict) or (
+            payload.get("schema") != QUERY_SYMBOL_CACHE_SCHEMA_VERSION
+        ):
+            # Missing/old schema → treat as a miss and rebuild.
+            return None
         entries_raw = payload.get("entries")
         if not isinstance(entries_raw, list):
             return None
@@ -459,6 +470,7 @@ class SemanticSearcher:
         entries: list[SymbolEntry],
     ) -> None:
         payload = {
+            "schema": QUERY_SYMBOL_CACHE_SCHEMA_VERSION,
             "rel": rel,
             "blob": blob,
             "entries": [
@@ -474,7 +486,7 @@ class SemanticSearcher:
             ],
         }
         try:
-            cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            atomic_write_text(cache_path, json.dumps(payload, ensure_ascii=False))
         except OSError:
             return
 

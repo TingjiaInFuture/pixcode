@@ -8,13 +8,12 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
 
 from .constants import LINT_CACHE_SCHEMA_VERSION
-from .file_utils import normalize_posix_path, resolve_repo_cache_root
+from .file_utils import atomic_write_text, normalize_posix_path, resolve_repo_cache_root
 from .js_parser import build_js_semantic_map
 from .lint_collector import iter_target_batches, ruff_severity
 from .models import FileInfo, LintIssue, RepoInfo, SemanticMap
@@ -330,25 +329,8 @@ class CodeInsightEngine:
             }
             for i in issues
         ]
-        tmp_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                delete=False,
-                dir=str(path.parent),
-                prefix=".",
-                suffix=".tmp",
-            ) as tmp:
-                tmp.write(json.dumps(payload, ensure_ascii=False))
-                tmp.flush()
-                os.fsync(tmp.fileno())
-                tmp_path = Path(tmp.name)
-            os.replace(tmp_path, path)
-        except OSError:
-            if tmp_path is not None:
-                with contextlib.suppress(OSError):
-                    tmp_path.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
 
     def _build_semantic_map(self, info: FileInfo) -> SemanticMap:
         # Text-like languages yield no semantic map; skip reading content for
@@ -384,7 +366,8 @@ class CodeInsightEngine:
 
         semantic_map = self._build_semantic_map(info)
         with contextlib.suppress(OSError):
-            cache_path.write_text(
+            atomic_write_text(
+                cache_path,
                 json.dumps(
                     {
                         "kind": semantic_map.kind,
@@ -395,7 +378,6 @@ class CodeInsightEngine:
                     },
                     ensure_ascii=False,
                 ),
-                encoding="utf-8",
             )
         return semantic_map
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
+import json
 import os
 import re
+import tempfile
 import unicodedata
 from pathlib import Path, PurePosixPath
 
@@ -218,3 +221,85 @@ def build_tree(rel_paths_posix: list[str], root_name: str, style: str = "ascii")
 
     walk(tree, "")
     return "\n".join(lines)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write text to ``path`` via a uniquely-named temp file.
+
+    A unique temp name (not a fixed ``path.tmp``) avoids two concurrent pixrep
+    processes clobbering each other's temp file; ``fsync`` + ``os.replace`` make
+    the destination either fully old or fully new, never half-written. Stale
+    temps are cleaned up if the replace fails.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            delete=False,
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        ) as tmp:
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with ``pid`` is currently running."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def repo_lock(cache_root: Path):
+    """Lightweight per-repo advisory lock.
+
+    Prevents two concurrent generation runs over the same cache root from
+    racing on the manifest/snapshot (lost update) or one output overwriting the
+    other. Uses a PID file with a liveness check so a crashed process does not
+    leave a permanent lock behind. Raises ``RuntimeError`` if another live
+    pixrep holds the lock.
+    """
+    cache_root.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_root / ".pixrep.lock"
+    if lock_path.exists():
+        try:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+            pid = int(data.get("pid", 0))
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            pid = 0
+        if pid and _pid_alive(pid):
+            raise RuntimeError(
+                f"another pixrep process (pid {pid}) is generating this repository; "
+                f"remove {lock_path} if it is stale"
+            )
+    try:
+        lock_path.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    except OSError:
+        # If we can't write the lock we can't enforce mutual exclusion — proceed
+        # rather than hard-failing a generation for a transient FS error.
+        yield
+        return
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            lock_path.unlink(missing_ok=True)

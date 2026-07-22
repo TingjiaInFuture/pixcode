@@ -16,14 +16,13 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-import os
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .constants import RENDER_SCHEMA_VERSION
+from .file_utils import atomic_write_text
 from .version import __version__
 
 
@@ -48,19 +47,23 @@ def _tool_version(tool: str) -> str:
 
 
 def _config_signature(paths: list[Path]) -> str:
-    """mtime+size signature of config files that affect lint output."""
-    h = hashlib.sha1()
+    """Content hash of config files that affect lint output.
+
+    Uses the file bytes (not mtime+size) so a config rewritten to the same
+    length with the same mtime still invalidates the cache — consistent with the
+    scanner's working-tree SHA-256 identity."""
+    h = hashlib.sha256()
     found = False
-    for p in paths:
-        if not p.exists():
-            continue
-        found = True
+    for p in sorted(paths):
         try:
-            st = p.stat()
-            h.update(f"{p}|{int(st.st_mtime_ns)}|{st.st_size}\n".encode())
+            data = p.read_bytes()
         except OSError:
             continue
-    return h.hexdigest()[:12] if found else ""
+        found = True
+        h.update(str(p.resolve()).encode("utf-8"))
+        h.update(b"\0")
+        h.update(hashlib.sha256(data).digest())
+    return h.hexdigest()[:16] if found else ""
 
 
 def compute_options_hash(
@@ -80,30 +83,40 @@ def compute_options_hash(
     Changing any of these must invalidate cached semantic maps, lint results,
     symbol index entries and rendered outputs.
     """
-    ruff_version = _tool_version("ruff")
-    eslint_version = _tool_version("eslint")
-
+    # Skip linter version + config probing entirely when the lint heatmap is
+    # disabled — no point spawning ruff/eslint --version on every cold run.
+    ruff_version = ""
+    eslint_version = ""
     ruff_config_sig = ""
     eslint_config_sig = ""
-    if repo_root is not None:
-        ruff_config_sig = _config_signature(
-            [
-                repo_root / "pyproject.toml",
-                repo_root / "ruff.toml",
-                repo_root / ".ruff.toml",
-            ]
-        )
-        eslint_config_sig = _config_signature(
-            [
-                repo_root / ".eslintrc.json",
-                repo_root / ".eslintrc.js",
-                repo_root / ".eslintrc.yml",
-                repo_root / ".eslintrc",
-                repo_root / "eslint.config.js",
-                repo_root / "eslint.config.mjs",
-                repo_root / "eslint.config.cjs",
-            ]
-        )
+    if enable_lint:
+        ruff_version = _tool_version("ruff")
+        eslint_version = _tool_version("eslint")
+        if repo_root is not None:
+            ruff_config_sig = _config_signature(
+                [
+                    repo_root / "pyproject.toml",
+                    repo_root / "ruff.toml",
+                    repo_root / ".ruff.toml",
+                ]
+            )
+            eslint_config_sig = _config_signature(
+                [
+                    repo_root / ".eslintrc.json",
+                    repo_root / ".eslintrc.js",
+                    repo_root / ".eslintrc.cjs",
+                    repo_root / ".eslintrc.yaml",
+                    repo_root / ".eslintrc.yml",
+                    repo_root / ".eslintrc",
+                    repo_root / "eslint.config.js",
+                    repo_root / "eslint.config.mjs",
+                    repo_root / "eslint.config.cjs",
+                    repo_root / "eslint.config.ts",
+                    repo_root / "eslint.config.mts",
+                    repo_root / "eslint.config.cts",
+                    repo_root / "package.json",
+                ]
+            )
 
     payload = "|".join(
         [
@@ -182,23 +195,5 @@ class BuildManifest:
                 for rel, e in self.files.items()
             },
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                delete=False,
-                dir=str(self.path.parent),
-                prefix=".manifest.",
-                suffix=".tmp",
-            ) as f:
-                f.write(json.dumps(payload, ensure_ascii=False))
-                f.flush()
-                os.fsync(f.fileno())
-                tmp = Path(f.name)
-            os.replace(tmp, self.path)
-        except OSError:
-            if tmp is not None:
-                with contextlib.suppress(OSError):
-                    tmp.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            atomic_write_text(self.path, json.dumps(payload, ensure_ascii=False))

@@ -4,7 +4,7 @@ import re
 import sys
 from pathlib import Path
 
-from .file_utils import normalize_posix_path, resolve_repo_cache_root
+from .file_utils import normalize_posix_path, repo_lock, resolve_repo_cache_root
 from .models import RepoInfo
 from .onepdf import pack_repo_to_one_pdf
 from .pdf_generator import PDFGenerator
@@ -701,6 +701,19 @@ def _run_help(
     return 0
 
 
+def _with_repo_lock(args: argparse.Namespace, fn) -> int:
+    """Run a generation command under a per-repo advisory lock so two concurrent
+    pixrep runs over the same repository don't race on the manifest/snapshot or
+    overwrite each other's output."""
+    repo_path = Path(args.repo).resolve()
+    try:
+        with repo_lock(resolve_repo_cache_root(repo_path)):
+            return fn(args)
+    except RuntimeError as exc:
+        log.error("%s", exc)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = sys.argv[1:] if argv is None else argv
     parser, commands = build_parser()
@@ -736,10 +749,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "query":
         return _run_query(args)
     if args.command in {"onepdf", "allinone"}:
-        return _run_onepdf(args)
+        return _with_repo_lock(args, _run_onepdf)
     if args.command == "help":
         return _run_help(args, parser, commands)
-    return _run_generate(args)
+    return _with_repo_lock(args, _run_generate)
 
 
 if __name__ == "__main__":

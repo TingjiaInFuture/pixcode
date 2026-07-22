@@ -4,13 +4,17 @@ import ast
 import contextlib
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .constants import ONEPDF_BLOCK_SCHEMA_VERSION, RENDER_SCHEMA_VERSION
+from .constants import (
+    IMPORTS_CACHE_SCHEMA_VERSION,
+    ONEPDF_BLOCK_SCHEMA_VERSION,
+    RENDER_SCHEMA_VERSION,
+)
 from .file_utils import (
+    atomic_write_text,
     build_tree,
     char_display_width,
     compile_ignore_matcher,
@@ -279,13 +283,8 @@ class _BlockCache:
 
     def save(self, git_blob: str, opts_sig: str, lines: list[str]) -> None:
         path = self._path(git_blob, opts_sig)
-        tmp = path.with_name("." + path.name + ".tmp")
-        try:
-            tmp.write_text(json.dumps(lines, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, path)
-        except OSError:
-            with contextlib.suppress(OSError):
-                tmp.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            atomic_write_text(path, json.dumps(lines, ensure_ascii=False))
 
 
 def _normalize_block(
@@ -396,12 +395,19 @@ def _python_imports(content: str, current_pkg: str = "") -> set[str]:
                 mods.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
             if node.level > 0:
-                # Relative import: resolve against the current package.
+                # Relative import (PEP 328): resolve against the current package.
                 drop = node.level - 1
-                base = pkg_parts[: len(pkg_parts) - drop] if drop <= len(pkg_parts) else []
-                target = [*base, node.module] if node.module else base
-                if target:
-                    mods.add(".".join(target))
+                if drop > len(pkg_parts):
+                    continue
+                base = pkg_parts[: len(pkg_parts) - drop]
+                if node.module:
+                    # `from .pkg import x` -> base.pkg
+                    mods.add(".".join([*base, node.module]))
+                else:
+                    # `from . import x` -> base.x (one entry per imported name)
+                    for alias in node.names:
+                        if alias.name != "*":
+                            mods.add(".".join([*base, alias.name]))
             elif node.module:
                 mods.add(node.module)
     return mods
@@ -409,13 +415,14 @@ def _python_imports(content: str, current_pkg: str = "") -> set[str]:
 
 class _ImportsCache:
     """Cache of a Python file's resolved imports keyed by (content hash,
-    current package), so --order dependency doesn't re-read + AST-parse every
-    Python file when the snapshot/block caches are warm.
+    current package, schema version), so --order dependency doesn't re-read +
+    AST-parse every Python file when the snapshot/block caches are warm.
 
     The package is part of the key because relative imports (``from . import x``)
     resolve differently depending on which package the file lives in: two files
     with byte-identical content but different packages yield different resolved
-    module names and must not share a cache entry."""
+    module names and must not share a cache entry. The schema version lets an
+    upgrade to the import-resolution algorithm invalidate every stale entry."""
 
     def __init__(self, cache_dir: Path | None):
         self.cache_dir = cache_dir / "imports" if cache_dir else None
@@ -425,7 +432,9 @@ class _ImportsCache:
     def _path(self, blob: str, current_pkg: str) -> Path | None:
         if self.cache_dir is None:
             return None
-        key = hashlib.sha256(f"{blob}\0{current_pkg}".encode()).hexdigest()
+        key = hashlib.sha256(
+            f"{IMPORTS_CACHE_SCHEMA_VERSION}\0{blob}\0{current_pkg}".encode()
+        ).hexdigest()
         return self.cache_dir / f"{key}.json"
 
     def load(self, blob: str, current_pkg: str) -> list[str] | None:
@@ -436,14 +445,18 @@ class _ImportsCache:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        return data if isinstance(data, list) else None
+        if not isinstance(data, dict) or data.get("schema") != IMPORTS_CACHE_SCHEMA_VERSION:
+            return None
+        entries = data.get("entries")
+        return entries if isinstance(entries, list) else None
 
     def save(self, blob: str, current_pkg: str, imports: list[str]) -> None:
         path = self._path(blob, current_pkg)
         if path is None:
             return
+        payload = {"schema": IMPORTS_CACHE_SCHEMA_VERSION, "entries": imports}
         with contextlib.suppress(OSError):
-            _atomic_write_text(path, json.dumps(imports))
+            atomic_write_text(path, json.dumps(payload, ensure_ascii=False))
 
 
 def _dependency_order(files: list[PackedFile], cache_dir: Path | None = None) -> None:
@@ -484,16 +497,6 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_name("." + path.name + ".tmp")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink(missing_ok=True)
 
 
 def _onepdf_build_signature(
@@ -703,5 +706,5 @@ def pack_repo_to_one_pdf(
             "pages": writer.page_count,
         }
         with contextlib.suppress(OSError):
-            _atomic_write_text(sig_path, json.dumps(meta, ensure_ascii=False))
+            atomic_write_text(sig_path, json.dumps(meta, ensure_ascii=False))
     return stats

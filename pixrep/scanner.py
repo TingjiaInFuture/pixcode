@@ -3,11 +3,13 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import subprocess
 from pathlib import Path
 
 from .constants import DEFAULT_IGNORE_PATTERNS, SNAPSHOT_SCHEMA_VERSION
 from .file_utils import (
+    atomic_write_text,
     build_tree,
     compile_ignore_matcher,
     detect_language,
@@ -62,10 +64,7 @@ class RepoScanner:
         if not self._snapshot_path or not self._snapshot_dirty:
             return
         try:
-            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._snapshot_path.with_name("." + self._snapshot_path.name + ".tmp")
-            tmp.write_text(json.dumps(self._snapshot), encoding="utf-8")
-            os.replace(tmp, self._snapshot_path)
+            atomic_write_text(self._snapshot_path, json.dumps(self._snapshot, ensure_ascii=False))
         except OSError:
             log.debug("failed to save scanner snapshot", exc_info=True)
 
@@ -122,12 +121,16 @@ class RepoScanner:
             log.debug("failed to stream-count lines: %s (%s)", filepath, e)
             return None
 
-    def _git_ls_files_with_oid(self) -> tuple[list[Path], dict[str, str]] | None:
-        """Return (sorted abs paths, rel_posix -> oid) for a git repo, else None.
+    def _git_ls_files_with_oid(self) -> tuple[list[Path], dict[str, str], str] | None:
+        """Return (sorted abs paths, rel_posix -> oid, subdir_prefix) for a git
+        repo, else None.
 
-        A single `git ls-files -s` call yields both the tracked file list and
-        each file's stage OID, which we use as a stable content fingerprint
-        (FileInfo.git_blob) without re-reading file contents.
+        ``self.root`` may be the repository top or any subdirectory of a larger
+        monorepo. A single ``git ls-files -s -z`` run from ``self.root`` yields
+        both the tracked file list and each file's stage OID (used as a stable
+        content fingerprint without re-reading contents). ``subdir_prefix`` is
+        the repo-top-relative posix prefix of ``self.root`` ("" at the top) so
+        the dirty set can strip it from ``git status`` output.
         """
         if not self.prefer_git_source:
             return None
@@ -142,9 +145,17 @@ class RepoScanner:
             if top.returncode != 0:
                 return None
             top_root = Path(top.stdout.decode("utf-8", errors="replace").strip()).resolve()
-            if top_root != self.root:
+            # self.root may be the repo top or any subdirectory of a monorepo.
+            try:
+                sub_rel = self.root.resolve().relative_to(top_root)
+            except ValueError:
                 return None
+            sub_prefix = normalize_posix_path(sub_rel)
+            sub_prefix = sub_prefix + "/" if sub_prefix else ""
 
+            # ls-files reports paths relative to the current directory, so the
+            # parsed rels are already relative to self.root whether it is the
+            # repo top or a subdirectory.
             proc = subprocess.run(
                 ["git", "ls-files", "-s", "-z"],
                 cwd=str(self.root),
@@ -176,16 +187,21 @@ class RepoScanner:
             paths.append(self.root / Path(rel_str))
         if not paths:
             return None
-        return paths, oid_map
+        return paths, oid_map, sub_prefix
 
-    def _git_dirty_set(self) -> set[str] | None:
+    def _git_dirty_set(self, sub_prefix: str = "") -> set[str] | None:
         """Repo-relative posix paths git reports as modified/untracked, so the
         snapshot fast path can distrust their mtime+size.
 
+        ``sub_prefix`` is the repo-top-relative prefix of ``self.root`` (""
+        at the top): ``git status`` reports paths relative to the repo top, so
+        we keep only entries under our subdirectory and strip the prefix.
+
         Returns ``None`` (rather than an empty set) when git is unavailable,
-        fails, or times out: an empty set reads as "nothing is dirty" and would
-        let a transient git failure reuse stale snapshot hashes. Callers must
-        fall back to treating every file as dirty when this returns ``None``.
+        fails, times out, or yields a malformed record: an empty set reads as
+        "nothing is dirty" and would let a transient failure reuse stale
+        snapshot hashes. Callers must fall back to treating every file as dirty
+        when this returns ``None``.
         """
         try:
             proc = subprocess.run(
@@ -203,22 +219,36 @@ class RepoScanner:
         # use the platform's default codec (cp936/GBK on a Chinese Windows),
         # which raises UnicodeDecodeError on a non-ASCII filename and leaves
         # stdout as None. git's -z output is unquoted UTF-8.
+        # porcelain v1 -z records are NUL-separated. A normal record is
+        # "XY <path>"; a rename/copy ("R "/"C " status) is TWO NUL fields —
+        # "XY <new>\0<old>\0" — so consume by index and skip the old-path field
+        # instead of letting it be parsed as a bogus extra record.
+        records = proc.stdout.split(b"\0")
         dirty: set[str] = set()
-        for entry in proc.stdout.split(b"\0"):
+        i = 0
+        while i < len(records):
+            entry = records[i]
+            i += 1
             if not entry:
                 continue
-            # porcelain v1 -z record: "XY <path>" (two status chars + a space,
-            # then the literal path with no quoting). A rename is
-            # "XY <src>\t<dst>" — keep the destination path. Because the path is
-            # everything after the fixed 3-byte prefix, embedded spaces (and any
-            # other character except NUL) survive intact.
             if len(entry) < 3:
-                continue
+                return None  # malformed → strict fallback (distrust everything)
+            status = entry[:2]
             path_part = entry[3:]
-            if b"\t" in path_part:
-                path_part = path_part.rsplit(b"\t", 1)[-1]
-            if path_part:
-                dirty.add(normalize_posix_path(path_part.decode("utf-8", errors="replace")))
+            if (b"R" in status or b"C" in status) and i < len(records):
+                # The next NUL field is the pre-rename path; skip it.
+                i += 1
+            if not path_part:
+                continue
+            path_str = path_part.decode("utf-8", errors="replace")
+            if sub_prefix:
+                # status paths are relative to the repo top; keep only those
+                # under our subdirectory and strip the prefix.
+                if not path_str.startswith(sub_prefix):
+                    continue
+                path_str = path_str[len(sub_prefix) :]
+            if path_str:
+                dirty.add(normalize_posix_path(path_str))
         return dirty
 
     def _walk_files(self):
@@ -246,6 +276,16 @@ class RepoScanner:
         rel_posix = normalize_posix_path(rel_path)
         if self._should_ignore_file(rel_posix, filepath.name):
             return ("ignored_by_pattern", None)
+
+        # Skip symlinks by default: a link like secret.txt -> ~/.ssh/id_rsa
+        # would otherwise be followed by is_file()/read_bytes() and exfiltrate a
+        # file outside the repo into the PDF. lstat() does not follow the link.
+        try:
+            lst = filepath.lstat()
+        except OSError:
+            return ("skipped_unreadable", None)
+        if stat.S_ISLNK(lst.st_mode):
+            return ("skipped_path_escape", None)
 
         try:
             st = filepath.stat()
@@ -373,13 +413,15 @@ class RepoScanner:
             "skipped_unreadable": 0,
             "skipped_size_or_empty": 0,
             "skipped_binary": 0,
+            "skipped_path_escape": 0,
         }
 
         oid_map: dict[str, str] = {}
+        sub_prefix = ""
         git_info = self._git_ls_files_with_oid()
         if git_info is not None:
             repo.source_mode = "git"
-            git_paths, oid_map = git_info
+            git_paths, oid_map, sub_prefix = git_info
             candidates = sorted(p for p in git_paths if p.is_file())
             repo.tracked_paths = set(oid_map.keys())
         else:
@@ -402,7 +444,7 @@ class RepoScanner:
         # an empty dirty set would mean "trust every snapshot" and could let a
         # transient git failure (lock, timeout, fs error) reuse stale hashes.
         if self._snapshot_mode == "git-fast" and repo.source_mode == "git":
-            dirty = self._git_dirty_set()
+            dirty = self._git_dirty_set(sub_prefix)
             if dirty is None:
                 dirty = candidate_rels
         else:
