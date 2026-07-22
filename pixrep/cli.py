@@ -410,7 +410,7 @@ def _configure_logging(level: str) -> None:
 
 
 def _scan_repo(
-    args: argparse.Namespace, include_content: bool = True
+    args: argparse.Namespace, include_content: bool = True, *, save_snapshot: bool = True
 ) -> tuple[RepoInfo | None, int]:
     repo_path = Path(args.repo).resolve()
     if not repo_path.is_dir():
@@ -424,19 +424,20 @@ def _scan_repo(
         extra_ignore=args.ignore,
         snapshot_path=_snapshot_path(repo_path),
     )
-    repo = scanner.scan(include_content=include_content)
+    repo = scanner.scan(include_content=include_content, save_snapshot=save_snapshot)
     if not repo.files:
         log.info("No files found.")
         return repo, 0
     stats = repo.scan_stats
     log.info(
-        "Scan summary: seen=%d, loaded=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d",
+        "Scan summary: seen=%d, loaded=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d, path_escape=%d",
         stats.get("seen_files", 0),
         len(repo.files),
         stats.get("ignored_by_pattern", 0),
         stats.get("skipped_size_or_empty", 0),
         stats.get("skipped_binary", 0),
         stats.get("skipped_unreadable", 0),
+        stats.get("skipped_path_escape", 0),
     )
     return repo, 0
 
@@ -503,7 +504,7 @@ def _run_generate(args: argparse.Namespace) -> int:
 
 
 def _run_list(args: argparse.Namespace) -> int:
-    repo, code = _scan_repo(args, include_content=False)
+    repo, code = _scan_repo(args, include_content=False, save_snapshot=False)
     if code != 0 or repo is None or not repo.files:
         return code
     _print_repo_list(repo, top_languages=args.top_languages)
@@ -554,13 +555,14 @@ def _run_onepdf(args: argparse.Namespace) -> int:
         incremental=args.incremental,
     )
     log.info(
-        "onepdf summary: seen=%d, included=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d, pages=%d, output=%d bytes, incremental_skip=%d",
+        "onepdf summary: seen=%d, included=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d, path_escape=%d, pages=%d, output=%d bytes, incremental_skip=%d",
         stats.get("seen_files", 0),
         stats.get("included", 0),
         stats.get("ignored_by_pattern", 0),
         stats.get("skipped_size_or_empty", 0),
         stats.get("skipped_binary", 0),
         stats.get("skipped_unreadable", 0),
+        stats.get("skipped_path_escape", 0),
         stats.get("pages", 0),
         stats.get("output_bytes", 0),
         stats.get("skipped_incremental", 0),
@@ -583,7 +585,7 @@ def _run_query(args: argparse.Namespace) -> int:
     # index, so it still scans the repo. Text search goes ripgrep-first and
     # only scans the hit files afterwards (P0-2).
     if args.semantic:
-        repo, code = _scan_repo(args, include_content=False)
+        repo, code = _scan_repo(args, include_content=False, save_snapshot=False)
         if code != 0 or repo is None or not repo.files:
             return code
         semantic_searcher = SemanticSearcher(repo=repo, max_results=args.max_results)

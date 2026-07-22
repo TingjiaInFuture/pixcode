@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import hashlib
-import json
 import os
 import re
 import tempfile
@@ -253,53 +252,58 @@ def atomic_write_text(path: Path, text: str) -> None:
                 tmp_path.unlink(missing_ok=True)
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if a process with ``pid`` is currently running."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
 @contextlib.contextmanager
 def repo_lock(cache_root: Path):
-    """Lightweight per-repo advisory lock.
+    """Per-repo mutual-exclusion lock backed by an OS file lock.
 
-    Prevents two concurrent generation runs over the same cache root from
-    racing on the manifest/snapshot (lost update) or one output overwriting the
-    other. Uses a PID file with a liveness check so a crashed process does not
-    leave a permanent lock behind. Raises ``RuntimeError`` if another live
-    pixrep holds the lock.
+    Holds an exclusive lock on ``cache_root/.pixrep.lock`` for the duration of
+    the block. Uses the OS locking primitive (``fcntl.flock`` on POSIX,
+    ``msvcrt.locking`` on Windows), which the OS releases automatically when
+    the process exits or crashes — so there is no stale-lock file to clean up
+    and no PID liveness probing. (On Windows ``os.kill(pid, 0)`` does NOT
+    probe: it routes to ``TerminateProcess`` and would kill the holder, or any
+    unrelated process that recycled the PID.) Raises ``RuntimeError`` if
+    another process already holds the lock.
     """
     cache_root.mkdir(parents=True, exist_ok=True)
     lock_path = cache_root / ".pixrep.lock"
-    if lock_path.exists():
-        try:
-            data = json.loads(lock_path.read_text(encoding="utf-8"))
-            pid = int(data.get("pid", 0))
-        except (OSError, json.JSONDecodeError, ValueError, TypeError):
-            pid = 0
-        if pid and _pid_alive(pid):
-            raise RuntimeError(
-                f"another pixrep process (pid {pid}) is generating this repository; "
-                f"remove {lock_path} if it is stale"
-            )
+    # Opened without `with`: the fd must stay open for the whole block to keep
+    # the OS lock held. "a+b" creates the file if absent without truncating.
+    fh = open(lock_path, "a+b")  # noqa: SIM115
+    locked = False
     try:
-        lock_path.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
-    except OSError:
-        # If we can't write the lock we can't enforce mutual exclusion — proceed
-        # rather than hard-failing a generation for a transient FS error.
-        yield
-        return
-    try:
+        if os.name == "nt":
+            import msvcrt
+
+            # msvcrt locks a byte range; ensure there is a byte at offset 0.
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError("another pixrep process is using this repository") from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise RuntimeError("another pixrep process is using this repository") from exc
+        locked = True
         yield
     finally:
-        with contextlib.suppress(OSError):
-            lock_path.unlink(missing_ok=True)
+        if locked:
+            with contextlib.suppress(OSError):
+                if os.name == "nt":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()

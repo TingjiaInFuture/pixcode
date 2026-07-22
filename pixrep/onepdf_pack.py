@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .constants import (
     IMPORTS_CACHE_SCHEMA_VERSION,
@@ -119,21 +119,34 @@ def collect_core_files(
         "skipped_size_or_empty": repo.scan_stats.get("skipped_size_or_empty", 0),
         "skipped_binary": repo.scan_stats.get("skipped_binary", 0),
         "skipped_not_included": 0,
-        "skipped_path_escape": 0,
+        "skipped_path_escape": repo.scan_stats.get("skipped_path_escape", 0),
         "skipped_not_git": 0,
     }
 
     for info in repo.files:
         rel_posix = normalize_posix_path(info.path)
 
-        # core-only: exclude markdown except README.md (kept for LLM context).
-        if (
-            core_only
-            and rel_posix.lower().endswith(".md")
-            and rel_posix.rsplit("/", 1)[-1].lower() != "readme.md"
-        ):
-            stats["ignored_by_pattern"] = stats.get("ignored_by_pattern", 0) + 1
-            continue
+        if core_only:
+            # Only the ROOT README.md is kept; nested README.md files are dropped.
+            is_root_readme = rel_posix.casefold() == "readme.md"
+            if rel_posix.lower().endswith(".md") and not is_root_readme:
+                stats["ignored_by_pattern"] = stats.get("ignored_by_pattern", 0) + 1
+                continue
+            # Drop tests/specs/fixtures even when nested (e.g.
+            # packages/foo/tests/...). The root-level globs in
+            # DEFAULT_CORE_IGNORE_PATTERNS only catch top-level directories.
+            parent_parts = {p.casefold() for p in PurePosixPath(rel_posix).parts[:-1]}
+            if parent_parts & {
+                "test",
+                "tests",
+                "__tests__",
+                "spec",
+                "specs",
+                "fixtures",
+                "mocks",
+            }:
+                stats["ignored_by_pattern"] = stats.get("ignored_by_pattern", 0) + 1
+                continue
 
         # git allow-list filter.
         if git_set is not None and rel_posix not in git_set:
@@ -401,15 +414,24 @@ def _python_imports(content: str, current_pkg: str = "") -> set[str]:
                     continue
                 base = pkg_parts[: len(pkg_parts) - drop]
                 if node.module:
-                    # `from .pkg import x` -> base.pkg
-                    mods.add(".".join([*base, node.module]))
+                    # `from .pkg import x` -> base.pkg, and also base.pkg.x so a
+                    # dependency on the imported name is detected.
+                    base_mod = ".".join([*base, node.module])
+                    mods.add(base_mod)
+                    for alias in node.names:
+                        if alias.name != "*":
+                            mods.add(f"{base_mod}.{alias.name}")
                 else:
                     # `from . import x` -> base.x (one entry per imported name)
                     for alias in node.names:
                         if alias.name != "*":
                             mods.add(".".join([*base, alias.name]))
             elif node.module:
+                # Absolute: `from pkg import x` -> pkg, and also pkg.x.
                 mods.add(node.module)
+                for alias in node.names:
+                    if alias.name != "*":
+                        mods.add(f"{node.module}.{alias.name}")
     return mods
 
 

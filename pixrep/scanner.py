@@ -268,18 +268,22 @@ class RepoScanner:
             oid_map = {}
         if dirty is None:
             dirty = set()
+        # Resolve the real path and require it to stay inside the repo root.
+        # A lexical `relative_to` is fooled by "../" tricks
+        # (e.g. /repo/../secret.txt); resolve(strict=True) follows symlinks too,
+        # so a link pointing outside the repo fails relative_to here.
         try:
-            rel_path = filepath.relative_to(self.root)
-        except ValueError:
-            return ("skipped_unreadable", None)
+            resolved = filepath.resolve(strict=True)
+            rel_path = resolved.relative_to(self.root)
+        except (OSError, ValueError):
+            return ("skipped_path_escape", None)
 
         rel_posix = normalize_posix_path(rel_path)
-        if self._should_ignore_file(rel_posix, filepath.name):
+        if self._should_ignore_file(rel_posix, resolved.name):
             return ("ignored_by_pattern", None)
 
-        # Skip symlinks by default: a link like secret.txt -> ~/.ssh/id_rsa
-        # would otherwise be followed by is_file()/read_bytes() and exfiltrate a
-        # file outside the repo into the PDF. lstat() does not follow the link.
+        # Skip symlinks by default even when their target is inside the repo
+        # (don't follow links). resolve() already rejected links that escape.
         try:
             lst = filepath.lstat()
         except OSError:
@@ -288,7 +292,7 @@ class RepoScanner:
             return ("skipped_path_escape", None)
 
         try:
-            st = filepath.stat()
+            st = resolved.stat()
             size = st.st_size
             mtime_ns = int(st.st_mtime_ns)
         except OSError:
@@ -298,7 +302,7 @@ class RepoScanner:
             return ("skipped_size_or_empty", None)
 
         git_index_oid = oid_map.get(rel_posix)
-        language = self._detect_language(filepath)
+        language = self._detect_language(resolved)
 
         # Snapshot fast path (ONEPDF snapshot): when (mtime, size) is unchanged
         # and the schema matches, reuse the cached sha256 / line_count / is_text
@@ -315,7 +319,7 @@ class RepoScanner:
                 return ("skipped_binary", None)
             content = ""
             if include_content:
-                blob = self._read_bytes(filepath)
+                blob = self._read_bytes(resolved)
                 if blob is None:
                     return ("skipped_unreadable", None)
                 content = blob.decode(encoding="utf-8", errors="replace")
@@ -323,7 +327,7 @@ class RepoScanner:
                 "ok",
                 FileInfo(
                     path=rel_path,
-                    abs_path=filepath,
+                    abs_path=resolved,
                     language=language,
                     size=size,
                     mtime_ns=mtime_ns,
@@ -336,7 +340,7 @@ class RepoScanner:
 
         # Miss: read the file body once for binary detection + line count +
         # content hash (single read, P1-3).
-        blob = self._read_bytes(filepath)
+        blob = self._read_bytes(resolved)
         if blob is None:
             return ("skipped_unreadable", None)
         if not is_probably_text(blob[:8192]):
@@ -350,7 +354,7 @@ class RepoScanner:
 
         info = FileInfo(
             path=rel_path,
-            abs_path=filepath,
+            abs_path=resolved,
             language=language,
             size=size,
             mtime_ns=mtime_ns,
@@ -403,7 +407,7 @@ class RepoScanner:
             info.index = index
         return results
 
-    def scan(self, include_content: bool = True) -> RepoInfo:
+    def scan(self, include_content: bool = True, *, save_snapshot: bool = True) -> RepoInfo:
         """Scan repository files and return a populated RepoInfo."""
         repo = RepoInfo(root=self.root, name=self.root.name)
         files: list[FileInfo] = []
@@ -478,8 +482,9 @@ class RepoScanner:
         )
         repo.tree_str = self._build_tree(files)
         repo.scan_stats = scan_stats
-        self._prune_snapshot(candidate_rels)
-        self._save_snapshot()
+        if save_snapshot:
+            self._prune_snapshot(candidate_rels)
+            self._save_snapshot()
         return repo
 
     def _build_tree(self, files: list[FileInfo]) -> str:

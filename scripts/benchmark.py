@@ -75,6 +75,12 @@ def main(repo: str) -> int:
     py = sys.executable
     failures: list[str] = []
 
+    # Resolve the repo to an absolute path now: subprocesses run with
+    # cwd=SOURCE_ROOT, so a relative `../other-repo` would otherwise be
+    # interpreted relative to the source tree, not the caller's cwd.
+    repo = str(Path(repo).expanduser().resolve())
+    source_root = str(Path(SOURCE_ROOT).resolve())
+
     # Verify a subprocess resolves pixrep to the source tree, not a stale
     # installed copy in site-packages — otherwise every measurement below is
     # meaningless.
@@ -82,8 +88,13 @@ def main(repo: str) -> int:
         **os.environ,
         "PYTHONPATH": SOURCE_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""),
     }
+    probe_script = (
+        "from pathlib import Path\n"
+        "import pixrep, sys\n"
+        f"sys.exit(0 if Path(pixrep.__file__).resolve().is_relative_to({source_root!r}) else 1)"
+    )
     probe = subprocess.run(
-        [py, "-c", f"import pixrep; assert {SOURCE_ROOT!r} in pixrep.__file__"],
+        [py, "-c", probe_script],
         capture_output=True,
         env=probe_env,
         cwd=SOURCE_ROOT,

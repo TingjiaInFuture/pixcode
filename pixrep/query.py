@@ -223,7 +223,9 @@ class RipgrepSearcher:
             rel = abs_p.relative_to(self.repo_root)
             rel_posix = normalize_posix_path(rel)
         except (ValueError, OSError):
-            rel_posix = normalize_posix_path(path_text)
+            # Path outside the repo or unresolvable — drop it rather than feed
+            # an unverified path downstream.
+            return None
 
         line_number = int(data.get("line_number", 0))
         lines_data = data.get("lines", {})
