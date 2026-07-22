@@ -554,7 +554,7 @@ def _run_onepdf(args: argparse.Namespace) -> int:
         incremental=args.incremental,
     )
     log.info(
-        "onepdf summary: seen=%d, included=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d, pages=%d, output=%d bytes",
+        "onepdf summary: seen=%d, included=%d, ignored=%d, size/empty=%d, binary=%d, errors=%d, pages=%d, output=%d bytes, incremental_skip=%d",
         stats.get("seen_files", 0),
         stats.get("included", 0),
         stats.get("ignored_by_pattern", 0),
@@ -563,6 +563,7 @@ def _run_onepdf(args: argparse.Namespace) -> int:
         stats.get("skipped_unreadable", 0),
         stats.get("pages", 0),
         stats.get("output_bytes", 0),
+        stats.get("skipped_incremental", 0),
     )
     log.info("PDF: %s", Path(out_pdf).resolve())
     return 0

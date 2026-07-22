@@ -17,6 +17,7 @@ from .file_utils import (
     display_width,
     normalize_posix_path,
 )
+from .fonts import register_fonts
 from .onepdf_writer import StreamingPDFWriter
 from .scanner import RepoScanner
 from .version import __version__
@@ -407,22 +408,28 @@ def _python_imports(content: str, current_pkg: str = "") -> set[str]:
 
 
 class _ImportsCache:
-    """Cache of a Python file's resolved imports keyed by its content hash, so
-    --order dependency doesn't re-read + AST-parse every Python file when the
-    snapshot/block caches are warm."""
+    """Cache of a Python file's resolved imports keyed by (content hash,
+    current package), so --order dependency doesn't re-read + AST-parse every
+    Python file when the snapshot/block caches are warm.
+
+    The package is part of the key because relative imports (``from . import x``)
+    resolve differently depending on which package the file lives in: two files
+    with byte-identical content but different packages yield different resolved
+    module names and must not share a cache entry."""
 
     def __init__(self, cache_dir: Path | None):
         self.cache_dir = cache_dir / "imports" if cache_dir else None
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _path(self, blob: str) -> Path | None:
+    def _path(self, blob: str, current_pkg: str) -> Path | None:
         if self.cache_dir is None:
             return None
-        return self.cache_dir / f"{hashlib.sha256(blob.encode('utf-8')).hexdigest()}.json"
+        key = hashlib.sha256(f"{blob}\0{current_pkg}".encode()).hexdigest()
+        return self.cache_dir / f"{key}.json"
 
-    def load(self, blob: str) -> list[str] | None:
-        path = self._path(blob)
+    def load(self, blob: str, current_pkg: str) -> list[str] | None:
+        path = self._path(blob, current_pkg)
         if path is None or not path.exists():
             return None
         try:
@@ -431,8 +438,8 @@ class _ImportsCache:
             return None
         return data if isinstance(data, list) else None
 
-    def save(self, blob: str, imports: list[str]) -> None:
-        path = self._path(blob)
+    def save(self, blob: str, current_pkg: str, imports: list[str]) -> None:
+        path = self._path(blob, current_pkg)
         if path is None:
             return
         with contextlib.suppress(OSError):
@@ -450,7 +457,8 @@ def _dependency_order(files: list[PackedFile], cache_dir: Path | None = None) ->
     for f in files:
         if f.language != "python":
             continue
-        cached = imports_cache.load(f.git_blob)
+        pkg = _module_name(str(f.rel_posix).rsplit("/", 1)[0]) if "/" in f.rel_posix else ""
+        cached = imports_cache.load(f.git_blob, pkg)
         if cached is not None:
             imps = set(cached)
         else:
@@ -458,9 +466,8 @@ def _dependency_order(files: list[PackedFile], cache_dir: Path | None = None) ->
                 content = f.abs_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            pkg = _module_name(str(f.rel_posix).rsplit("/", 1)[0]) if "/" in f.rel_posix else ""
             imps = _python_imports(content, pkg)
-            imports_cache.save(f.git_blob, sorted(imps))
+            imports_cache.save(f.git_blob, pkg, sorted(imps))
         for mod, target_rel in mod_to_rel.items():
             if target_rel == f.rel_posix:
                 continue
@@ -504,15 +511,18 @@ def _onepdf_build_signature(
     font_size: int,
     leading: int,
     page_height: int,
+    font_fingerprint: str = "",
 ) -> str:
     """Fingerprint of every input that affects the ONEPDF output bytes. If it
     matches the previous build and the output exists, the whole PDF render is
-    skipped (--incremental)."""
+    skipped (--incremental). The font fingerprint covers the actual backing
+    font file (not just the point size), so swapping the system CJK font
+    invalidates the cache."""
     parts = [
         f"repo={repo_name}",
         f"profile={profile}|det={int(deterministic)}|order={order}",
         f"tab={tab_size}|cols={max_cols}|wrap={int(wrap)}",
-        f"font={font_size}|leading={leading}|page={page_height}",
+        f"font={font_size}|leading={leading}|page={page_height}|fp={font_fingerprint}",
         f"tree={int(include_tree)}|index={int(include_index)}",
         f"schema={ONEPDF_BLOCK_SCHEMA_VERSION}|{RENDER_SCHEMA_VERSION}|{__version__}",
     ]
@@ -574,6 +584,11 @@ def pack_repo_to_one_pdf(
     page_height = 842
     max_lines = max(1, int((page_height - top - bottom) / leading))
 
+    # Resolve the font once and reuse it for both the build signature (so a
+    # system-font swap invalidates --incremental) and the writer (so we don't
+    # register fonts twice).
+    fonts = register_fonts()
+
     # --incremental: if the build signature is unchanged and the output exists,
     # skip the whole PDF render.
     sig = ""
@@ -592,6 +607,7 @@ def pack_repo_to_one_pdf(
             font_size=font_size,
             leading=leading,
             page_height=page_height,
+            font_fingerprint=fonts.fingerprint,
         )
         sig_path = out_pdf.with_name(out_pdf.name + ".buildsig")
         if out_pdf.exists() and sig_path.exists():
@@ -616,6 +632,7 @@ def pack_repo_to_one_pdf(
     writer = StreamingPDFWriter(
         title=f"{repo_root.name} onepdf",
         out_path=out_pdf,
+        fonts=fonts,
         deterministic=deterministic,
     )
 

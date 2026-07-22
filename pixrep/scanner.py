@@ -69,11 +69,15 @@ class RepoScanner:
         except OSError:
             log.debug("failed to save scanner snapshot", exc_info=True)
 
-    def _prune_snapshot(self, files: list[FileInfo]) -> None:
+    def _prune_snapshot(self, current_rel_paths: set[str]) -> None:
         if not self._snapshot_path:
             return
-        current = {normalize_posix_path(f.path) for f in files}
-        stale = [rel for rel in self._snapshot if rel not in current]
+        # Prune against every scanned candidate (text + binary), not just the
+        # files that made it into the report. Binary files are recorded in the
+        # snapshot with is_text=False so they can be skipped without re-reading;
+        # pruning against only the text files would drop them every run and
+        # force a fresh 8 KB binary probe each time.
+        stale = [rel for rel in self._snapshot if rel not in current_rel_paths]
         for rel in stale:
             self._snapshot.pop(rel, None)
         if stale:
@@ -132,21 +136,19 @@ class RepoScanner:
                 ["git", "rev-parse", "--show-toplevel"],
                 cwd=str(self.root),
                 capture_output=True,
-                text=True,
                 timeout=5,
                 check=False,
             )
             if top.returncode != 0:
                 return None
-            top_root = Path(top.stdout.strip()).resolve()
+            top_root = Path(top.stdout.decode("utf-8", errors="replace").strip()).resolve()
             if top_root != self.root:
                 return None
 
             proc = subprocess.run(
-                ["git", "ls-files", "-s"],
+                ["git", "ls-files", "-s", "-z"],
                 cwd=str(self.root),
                 capture_output=True,
-                text=True,
                 timeout=10,
                 check=False,
             )
@@ -155,51 +157,68 @@ class RepoScanner:
         if proc.returncode != 0:
             return None
 
+        # Raw bytes + manual UTF-8 decode: avoids the platform-default codec
+        # (cp936/GBK on Chinese Windows) choking on non-ASCII filenames.
         paths: list[Path] = []
         oid_map: dict[str, str] = {}
-        for line in proc.stdout.splitlines():
-            # Format: "<mode> <oid> <stage>\t<path>"
-            meta, _, rel = line.partition("\t")
+        for record in proc.stdout.split(b"\0"):
+            # NUL-terminated records; each is "<mode> <oid> <stage>\t<path>".
+            # Splitting on the tab (not strip) keeps leading/trailing spaces in
+            # a path intact; only the first tab separates meta from path.
+            meta, sep, rel = record.partition(b"\t")
+            if not sep:
+                continue
             parts = meta.split()
-            rel = rel.strip()
             if len(parts) < 2 or not rel:
                 continue
-            oid_map[normalize_posix_path(rel)] = parts[1]
-            paths.append(self.root / Path(rel))
+            rel_str = rel.decode("utf-8", errors="replace")
+            oid_map[normalize_posix_path(rel_str)] = parts[1].decode("utf-8", errors="replace")
+            paths.append(self.root / Path(rel_str))
         if not paths:
             return None
         return paths, oid_map
 
-    def _git_dirty_set(self) -> set[str]:
+    def _git_dirty_set(self) -> set[str] | None:
         """Repo-relative posix paths git reports as modified/untracked, so the
-        snapshot fast path can distrust their mtime+size."""
+        snapshot fast path can distrust their mtime+size.
+
+        Returns ``None`` (rather than an empty set) when git is unavailable,
+        fails, or times out: an empty set reads as "nothing is dirty" and would
+        let a transient git failure reuse stale snapshot hashes. Callers must
+        fall back to treating every file as dirty when this returns ``None``.
+        """
         try:
             proc = subprocess.run(
-                ["git", "status", "--porcelain=v2", "-z"],
+                ["git", "status", "--porcelain=v1", "-z"],
                 cwd=str(self.root),
                 capture_output=True,
-                text=True,
                 timeout=10,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return set()
+            return None
         if proc.returncode != 0:
-            return set()
+            return None
+        # Read raw bytes and decode paths as UTF-8 ourselves: ``text=True`` would
+        # use the platform's default codec (cp936/GBK on a Chinese Windows),
+        # which raises UnicodeDecodeError on a non-ASCII filename and leaves
+        # stdout as None. git's -z output is unquoted UTF-8.
         dirty: set[str] = set()
-        for entry in proc.stdout.split("\0"):
+        for entry in proc.stdout.split(b"\0"):
             if not entry:
                 continue
-            parts = entry.split(" ")
-            if not parts:
+            # porcelain v1 -z record: "XY <path>" (two status chars + a space,
+            # then the literal path with no quoting). A rename is
+            # "XY <src>\t<dst>" — keep the destination path. Because the path is
+            # everything after the fixed 3-byte prefix, embedded spaces (and any
+            # other character except NUL) survive intact.
+            if len(entry) < 3:
                 continue
-            path = parts[-1]
-            if parts[0] == "?" and len(parts) >= 2:
-                path = parts[1]
-            if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
-                path = path[1:-1]
-            if path:
-                dirty.add(normalize_posix_path(path))
+            path_part = entry[3:]
+            if b"\t" in path_part:
+                path_part = path_part.rsplit(b"\t", 1)[-1]
+            if path_part:
+                dirty.add(normalize_posix_path(path_part.decode("utf-8", errors="replace")))
         return dirty
 
     def _walk_files(self):
@@ -368,13 +387,26 @@ class RepoScanner:
             candidates = list(self._walk_files())
         scan_stats["seen_files"] = len(candidates)
 
+        # Every candidate's rel path — used to fall back to "all dirty" when git
+        # status fails, and to prune snapshot entries for deleted files.
+        candidate_rels: set[str] = set()
+        for p in candidates:
+            try:
+                candidate_rels.add(normalize_posix_path(p.relative_to(self.root)))
+            except ValueError:
+                continue
+
         # git-fast: distrust the snapshot for files git reports as dirty, so a
         # tool that preserves mtime+size while changing content can't fool us.
-        dirty = (
-            self._git_dirty_set()
-            if self._snapshot_mode == "git-fast" and repo.source_mode == "git"
-            else set()
-        )
+        # If git status itself fails we treat ALL files as dirty (strict):
+        # an empty dirty set would mean "trust every snapshot" and could let a
+        # transient git failure (lock, timeout, fs error) reuse stale hashes.
+        if self._snapshot_mode == "git-fast" and repo.source_mode == "git":
+            dirty = self._git_dirty_set()
+            if dirty is None:
+                dirty = candidate_rels
+        else:
+            dirty = set()
 
         max_workers = max(1, min(self.scan_workers, len(candidates) or 1))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -404,7 +436,7 @@ class RepoScanner:
         )
         repo.tree_str = self._build_tree(files)
         repo.scan_stats = scan_stats
-        self._prune_snapshot(files)
+        self._prune_snapshot(candidate_rels)
         self._save_snapshot()
         return repo
 
